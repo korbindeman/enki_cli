@@ -1,0 +1,81 @@
+[package]
+name = "enki"
+version = "0.1.0"
+authors = ["Korbin de Man <korbindeman4@gmail.com>"]
+edition = "2021"
+description = "CLI for Enki - Link your machine to the Enki AI assistant"
+
+[[bin]]
+name = "enki"
+path = "src/main.rs"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP/WebSocket
+reqwest = { version = "0.12", features = ["json"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# ACP (Agent Client Protocol) for Claude Code
+agent-client-protocol = "0.9"
+tokio-util = { version = "0.7", features = ["compat"] }
+async-trait = "0.1"
+
+# Utils
+dirs = "5"
+open = "5"
+tiny_http = "0.12"
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+urlencoding = "2"
+keepawake = "0.6"
+trash = "5"
+ignore = "0.4"
+glob = "0.3"
+pdf_core = { git = "https://github.com/korbindeman/pdf", package = "pdf_core" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+# Deny unwraps and easy ways out
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+
+# Deny error handling shortcuts
+unwrap_in_result = "deny"
+map_err_ignore = "deny"
+try_err = "deny"
+
+# Deny correctness issues
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+cast_possible_wrap = "deny"
+float_cmp = "deny"
+missing_errors_doc = "deny"
+
+# Warn on code quality
+needless_pass_by_value = "warn"
+redundant_clone = "warn"
+inefficient_to_string = "warn"
+manual_string_new = "warn"
+implicit_clone = "warn"
+cloned_instead_of_copied = "warn"
+unused_self = "warn"
+semicolon_if_nothing_returned = "warn"
+manual_strip = "warn"
+unnecessary_map_or = "warn"
