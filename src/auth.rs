@@ -253,7 +253,9 @@ pub async fn get_jwt(refresh_token: &str) -> Result<String> {
         .context("Failed to connect to server")?;
 
     if !resp.status().is_success() {
-        bail!("Token refresh failed");
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        bail!("Token refresh failed ({}): {}", status, body);
     }
 
     let body: serde_json::Value = resp.json().await?;

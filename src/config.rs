@@ -112,7 +112,7 @@ fn default_server_url() -> &'static str {
 
 #[cfg(not(debug_assertions))]
 fn default_server_url() -> &'static str {
-    "https://enki.works"
+    "https://api.enki.works"
 }
 
 #[cfg(debug_assertions)]
