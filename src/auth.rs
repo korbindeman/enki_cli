@@ -9,15 +9,23 @@ use crate::config::{self, Credentials};
 
 const CALLBACK_PORT: u16 = 9876;
 
-/// Perform login flow
+/// Perform login flow (standalone command)
 pub async fn login() -> Result<()> {
-    // Check if already logged in
     if let Some(creds) = config::load_credentials()? {
         println!("Already authenticated as: {}", creds.email);
         println!("Run 'enki logout' to sign out first.");
         return Ok(());
     }
 
+    let creds = login_flow().await?;
+    println!("Authenticated as: {}", creds.email);
+    println!("\nYou can now run 'enki link' to connect this machine.");
+    Ok(())
+}
+
+/// Core login flow: open browser, wait for callback, save credentials.
+/// Returns the credentials on success. Does not check for existing credentials.
+pub async fn login_flow() -> Result<Credentials> {
     println!("Opening browser for authentication...");
 
     // Generate state token
@@ -148,7 +156,6 @@ pub async fn login() -> Result<()> {
     drop(stream);
 
     // Extract credentials
-
     let refresh_token = params.get("refresh_token").map(|s| s.to_string());
     let user_id = params.get("user_id").map(|s| s.to_string());
     let email = params.get("email").map(|s| s.to_string());
@@ -158,20 +165,17 @@ pub async fn login() -> Result<()> {
             let creds = Credentials {
                 refresh_token,
                 user_id,
-                email: email.clone(),
+                email,
             };
 
             config::save_credentials(&creds)?;
 
-            println!("Authenticated as: {}", email);
-            println!("\nYou can now run 'enki link' to connect this machine.");
+            Ok(creds)
         }
         _ => {
             bail!("Authentication failed - missing token or user info");
         }
     }
-
-    Ok(())
 }
 
 /// Show authentication status and detected capabilities

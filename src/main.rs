@@ -6,6 +6,7 @@ mod auth;
 mod claude_code;
 mod config;
 mod link;
+mod update;
 
 #[derive(Parser)]
 #[command(name = "enki")]

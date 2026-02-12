@@ -171,6 +171,9 @@ async fn try_dev_credentials() -> Result<config::Credentials> {
 
 /// Start the link connection
 pub async fn start(capabilities_filter: Option<String>, persistent: bool) -> Result<()> {
+    // Check for updates before anything else (no-op in debug builds)
+    crate::update::check_and_prompt().await?;
+
     let _lock = LinkLock::acquire()?;
 
     // In debug builds, always use dev credentials
@@ -180,13 +183,22 @@ pub async fn start(capabilities_filter: Option<String>, persistent: bool) -> Res
             println!("Using dev credentials");
             creds
         }
-        Err(_) => {
-            config::load_credentials()?.context("Not authenticated. Run 'enki login' first.")?
-        }
+        Err(_) => match config::load_credentials()? {
+            Some(creds) => creds,
+            None => {
+                println!("Not authenticated. Starting login...\n");
+                crate::auth::login_flow().await?
+            }
+        },
     };
     #[cfg(not(debug_assertions))]
-    let creds =
-        config::load_credentials()?.context("Not authenticated. Run 'enki login' first.")?;
+    let creds = match config::load_credentials()? {
+        Some(creds) => creds,
+        None => {
+            println!("Not authenticated. Starting login...\n");
+            crate::auth::login_flow().await?
+        }
+    };
 
     println!("Connecting as {}...", creds.email);
 
@@ -674,11 +686,7 @@ async fn execute_capability(capability: &str, params: &serde_json::Value) -> Res
             // Whitespace-normalized fallback
             let normalize = |s: &str| -> String {
                 s.lines()
-                    .map(|line| {
-                        line.split_whitespace()
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    })
+                    .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
                     .collect::<Vec<_>>()
                     .join("\n")
             };
