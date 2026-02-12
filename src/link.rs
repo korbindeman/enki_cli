@@ -221,9 +221,20 @@ pub async fn start(capabilities_filter: Option<String>, persistent: bool) -> Res
     };
 
     // Exchange refresh token for a JWT to use for WS auth
-    let jwt = crate::auth::get_jwt(&creds.refresh_token)
-        .await
-        .context("Failed to get JWT. Try 'enki login' to re-authenticate.")?;
+    // If the token is stale, re-authenticate automatically
+    let (jwt, creds) = match crate::auth::get_jwt(&creds.refresh_token).await {
+        Ok(jwt) => (jwt, creds),
+        Err(_) => {
+            println!("Session expired. Re-authenticating...\n");
+            config::delete_credentials()?;
+            let new_creds = crate::auth::login_flow().await?;
+            let jwt = crate::auth::get_jwt(&new_creds.refresh_token)
+                .await
+                .context("Failed to get JWT after re-authentication.")?;
+            (jwt, new_creds)
+        }
+    };
+    let _ = creds; // used above, may be needed later
 
     // Connect to server (pass JWT as query param since WS headers are tricky)
     let ws_url = format!(
