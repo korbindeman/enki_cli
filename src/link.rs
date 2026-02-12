@@ -171,9 +171,6 @@ async fn try_dev_credentials() -> Result<config::Credentials> {
 
 /// Start the link connection
 pub async fn start(capabilities_filter: Option<String>, persistent: bool) -> Result<()> {
-    // Check for updates before anything else (no-op in debug builds)
-    crate::update::check_and_prompt().await?;
-
     let _lock = LinkLock::acquire()?;
 
     // In debug builds, always use dev credentials

@@ -39,6 +39,8 @@ enum Commands {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    update::check_and_prompt().await?;
+
     match cli.command {
         Commands::Login => auth::login().await?,
         Commands::Logout => auth::logout()?,

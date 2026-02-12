@@ -239,7 +239,8 @@ pub fn logout() -> Result<()> {
     Ok(())
 }
 
-/// Exchange a refresh token for a JWT
+/// Exchange a refresh token for a JWT.
+/// The server rotates refresh tokens on each exchange, so we save the new one.
 pub async fn get_jwt(refresh_token: &str) -> Result<String> {
     let url = format!("{}/api/auth/refresh", config::server_url());
 
@@ -260,6 +261,15 @@ pub async fn get_jwt(refresh_token: &str) -> Result<String> {
         .as_str()
         .context("Missing jwt in response")?
         .to_string();
+
+    // Server rotates the refresh token — save the new one
+    if let Some(new_refresh) = body["refresh_token"].as_str() {
+        if let Ok(Some(mut creds)) = config::load_credentials() {
+            creds.refresh_token = new_refresh.to_string();
+            let _ = config::save_credentials(&creds);
+        }
+    }
+
     Ok(jwt)
 }
 
