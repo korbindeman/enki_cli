@@ -36,10 +36,14 @@ pub fn load_credentials() -> Result<Option<Credentials>> {
 
     let contents = fs::read_to_string(&path).context("Failed to read credentials file")?;
 
-    let creds: Credentials =
-        serde_json::from_str(&contents).context("Failed to parse credentials")?;
-
-    Ok(Some(creds))
+    match serde_json::from_str(&contents) {
+        Ok(creds) => Ok(Some(creds)),
+        Err(_) => {
+            // Old or corrupt credentials file — remove it
+            let _ = fs::remove_file(&path);
+            Ok(None)
+        }
+    }
 }
 
 /// Save credentials to disk
