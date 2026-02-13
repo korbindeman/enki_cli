@@ -169,7 +169,15 @@ async fn try_dev_credentials() -> Result<config::Credentials> {
     })
 }
 
-/// Start the link connection
+/// Why the connection ended
+enum DisconnectReason {
+    /// Transient error (timeout, network blip) — should reconnect
+    Transient(String),
+    /// Server explicitly closed the connection — should reconnect (server may be restarting)
+    ServerClosed,
+}
+
+/// Start the link connection with automatic reconnection
 pub async fn start(capabilities_filter: Option<String>, persistent: bool) -> Result<()> {
     let _lock = LinkLock::acquire()?;
 
@@ -220,23 +228,46 @@ pub async fn start(capabilities_filter: Option<String>, persistent: bool) -> Res
         None
     };
 
-    // Exchange refresh token for a JWT to use for WS auth
-    // If the token is stale, re-authenticate automatically
-    let (jwt, creds) = match crate::auth::get_jwt(&creds.refresh_token).await {
-        Ok(jwt) => (jwt, creds),
-        Err(_) => {
-            println!("Session expired. Re-authenticating...\n");
-            config::delete_credentials()?;
-            let new_creds = crate::auth::login_flow().await?;
-            let jwt = crate::auth::get_jwt(&new_creds.refresh_token)
-                .await
-                .context("Failed to get JWT after re-authentication.")?;
-            (jwt, new_creds)
+    let mut backoff_secs = 1u64;
+    const MAX_BACKOFF_SECS: u64 = 30;
+
+    loop {
+        match run_connection(&creds, &capabilities).await {
+            Ok((DisconnectReason::Transient(reason), was_connected)) => {
+                eprintln!("Disconnected: {}", reason);
+                if was_connected {
+                    backoff_secs = 1;
+                }
+            }
+            Ok((DisconnectReason::ServerClosed, _)) => {
+                println!("Connection closed by server.");
+                backoff_secs = 1;
+            }
+            Err(e) => {
+                eprintln!("Connection failed: {}", e);
+            }
+        }
+
+        println!("Reconnecting in {}s...", backoff_secs);
+        tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
+        backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+    }
+}
+
+/// Run a single WebSocket connection. Returns (reason, was_connected).
+async fn run_connection(
+    creds: &config::Credentials,
+    capabilities: &[Capability],
+) -> Result<(DisconnectReason, bool)> {
+    // Exchange refresh token for a JWT
+    let jwt = match crate::auth::get_jwt(&creds.refresh_token).await {
+        Ok(jwt) => jwt,
+        Err(e) => {
+            return Err(e.context("Failed to get JWT"));
         }
     };
-    let _ = creds; // used above, may be needed later
 
-    // Connect to server (pass JWT as query param since WS headers are tricky)
+    // Connect to server
     let ws_url = format!(
         "{}/ws/link?token={}",
         config::server_url()
@@ -255,7 +286,7 @@ pub async fn start(capabilities_filter: Option<String>, persistent: bool) -> Res
 
     // Send announce message
     let announce = ClientMessage::Announce {
-        capabilities: capabilities.clone(),
+        capabilities: capabilities.to_vec(),
     };
     write
         .send(Message::Text(serde_json::to_string(&announce)?))
@@ -269,7 +300,7 @@ pub async fn start(capabilities_filter: Option<String>, persistent: bool) -> Res
 
     // Wrap in LocalSet since ACP futures are !Send
     let local = tokio::task::LocalSet::new();
-    local
+    let reason = local
         .run_until(async move {
             loop {
                 tokio::select! {
@@ -339,16 +370,13 @@ pub async fn start(capabilities_filter: Option<String>, persistent: bool) -> Res
                                 }
                             }
                             Some(Ok(Message::Close(_))) => {
-                                println!("Connection closed by server");
-                                break;
+                                return Ok::<_, anyhow::Error>((DisconnectReason::ServerClosed, true));
                             }
                             Some(Err(e)) => {
-                                eprintln!("WebSocket error: {}", e);
-                                break;
+                                return Ok((DisconnectReason::Transient(e.to_string()), true));
                             }
                             None => {
-                                println!("Connection closed");
-                                break;
+                                return Ok((DisconnectReason::Transient("connection closed".to_string()), true));
                             }
                             _ => {}
                         }
@@ -365,12 +393,10 @@ pub async fn start(capabilities_filter: Option<String>, persistent: bool) -> Res
                     }
                 }
             }
-
-            Ok::<_, anyhow::Error>(())
         })
         .await?;
 
-    Ok(())
+    Ok(reason)
 }
 
 /// Detect capabilities this machine can provide
