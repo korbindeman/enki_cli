@@ -105,22 +105,18 @@ pub fn web_url() -> String {
     std::env::var("ENKI_WEB_URL").unwrap_or_else(|_| default_web_url().to_string())
 }
 
-#[cfg(debug_assertions)]
 fn default_server_url() -> &'static str {
-    "http://localhost:8080"
+    if cfg!(debug_assertions) {
+        "http://localhost:8080"
+    } else {
+        "https://api.enki.works"
+    }
 }
 
-#[cfg(not(debug_assertions))]
-fn default_server_url() -> &'static str {
-    "https://api.enki.works"
-}
-
-#[cfg(debug_assertions)]
 fn default_web_url() -> &'static str {
-    "http://localhost:3000"
-}
-
-#[cfg(not(debug_assertions))]
-fn default_web_url() -> &'static str {
-    "https://enki.works"
+    if cfg!(debug_assertions) {
+        "http://localhost:3000"
+    } else {
+        "https://enki.works"
+    }
 }

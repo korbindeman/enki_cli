@@ -138,8 +138,7 @@ pub struct Tool {
     pub version: String,
 }
 
-/// Try to get dev credentials from the server (only works in dev mode)
-#[cfg(debug_assertions)]
+/// Try to get dev credentials from the server (only works when server is in dev mode)
 async fn try_dev_credentials() -> Result<config::Credentials> {
     let url = format!("{}/api/auth/dev", config::server_url());
     let resp = reqwest::get(&url).await?;
@@ -149,10 +148,7 @@ async fn try_dev_credentials() -> Result<config::Credentials> {
     }
 
     let body: serde_json::Value = resp.json().await?;
-    let refresh_token = body["refresh_token"]
-        .as_str()
-        .context("Missing refresh_token")?
-        .to_string();
+    let token = body["token"].as_str().context("Missing token")?.to_string();
     let user_id = body["user"]["id"]
         .as_str()
         .context("Missing user id")?
@@ -163,7 +159,7 @@ async fn try_dev_credentials() -> Result<config::Credentials> {
         .to_string();
 
     Ok(config::Credentials {
-        refresh_token,
+        refresh_token: token,
         user_id,
         email,
     })
@@ -181,8 +177,7 @@ enum DisconnectReason {
 pub async fn start(capabilities_filter: Option<String>, persistent: bool) -> Result<()> {
     let _lock = LinkLock::acquire()?;
 
-    // In debug builds, always use dev credentials
-    #[cfg(debug_assertions)]
+    // Try dev auth first (server decides if dev mode is active)
     let creds = match try_dev_credentials().await {
         Ok(creds) => {
             println!("Using dev credentials");
@@ -195,14 +190,6 @@ pub async fn start(capabilities_filter: Option<String>, persistent: bool) -> Res
                 crate::auth::login_flow().await?
             }
         },
-    };
-    #[cfg(not(debug_assertions))]
-    let creds = match config::load_credentials()? {
-        Some(creds) => creds,
-        None => {
-            println!("Not authenticated. Starting login...\n");
-            crate::auth::login_flow().await?
-        }
     };
 
     println!("Connecting as {}...", creds.email);
@@ -232,7 +219,10 @@ pub async fn start(capabilities_filter: Option<String>, persistent: bool) -> Res
     const MAX_BACKOFF_SECS: u64 = 30;
 
     loop {
-        match run_connection(&creds, &capabilities).await {
+        // Load latest credentials from disk (may have been rotated)
+        let current_creds = config::load_credentials()?.unwrap_or_else(|| creds.clone());
+
+        match run_connection(&current_creds, &capabilities).await {
             Ok((DisconnectReason::Transient(reason), was_connected)) => {
                 eprintln!("Disconnected: {}", reason);
                 if was_connected {
@@ -259,21 +249,13 @@ async fn run_connection(
     creds: &config::Credentials,
     capabilities: &[Capability],
 ) -> Result<(DisconnectReason, bool)> {
-    // Exchange refresh token for a JWT
-    let jwt = match crate::auth::get_jwt(&creds.refresh_token).await {
-        Ok(jwt) => jwt,
-        Err(e) => {
-            return Err(e.context("Failed to get JWT"));
-        }
-    };
-
-    // Connect to server
+    // Connect to server using refresh token directly
     let ws_url = format!(
         "{}/ws/link?token={}",
         config::server_url()
             .replace("http://", "ws://")
             .replace("https://", "wss://"),
-        urlencoding::encode(&jwt)
+        urlencoding::encode(&creds.refresh_token)
     );
 
     let (ws_stream, _response) = connect_async(&ws_url)
@@ -630,699 +612,725 @@ async fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Res
 /// Execute a capability request
 async fn execute_capability(capability: &str, params: &serde_json::Value) -> Result<String> {
     match capability {
-        "fs_read" => {
-            let path = params
-                .get("path")
-                .and_then(|v| v.as_str())
-                .context("Missing path parameter")?;
-            let path = expand_tilde(path);
+        "fs_read" => cap_fs_read(params).await,
+        "fs_write" => cap_fs_write(params).await,
+        "fs_edit" => cap_fs_edit(params).await,
+        "fs_list" => cap_fs_list(params).await,
+        "fs_trash" => cap_fs_trash(params).await,
+        "fs_move" => cap_fs_move(params).await,
+        "fs_rename" => cap_fs_rename(params).await,
+        "fs_search" => cap_fs_search(params).await,
+        "fs_grep" => cap_fs_grep(params).await,
+        "fs_mkdir" => cap_fs_mkdir(params).await,
+        "fs_copy" => cap_fs_copy(params).await,
+        "fs_open" => cap_fs_open(params).await,
+        "fs_reveal" => cap_fs_reveal(params).await,
+        "shell" => cap_shell(params).await,
+        "md_file_to_pdf" => cap_md_file_to_pdf(params).await,
+        "md_to_pdf" => cap_md_to_pdf(params).await,
+        "artifact_to_pdf" => cap_artifact_to_pdf(params).await,
+        _ => bail!("Unknown capability: {}", capability),
+    }
+}
 
-            let content = tokio::fs::read_to_string(&path)
-                .await
-                .context("Failed to read file")?;
+// ============================================================================
+// File system capabilities
+// ============================================================================
 
-            Ok(content)
+async fn cap_fs_read(params: &serde_json::Value) -> Result<String> {
+    let path = params
+        .get("path")
+        .and_then(|v| v.as_str())
+        .context("Missing path parameter")?;
+    let path = expand_tilde(path);
+
+    let content = tokio::fs::read_to_string(&path)
+        .await
+        .context("Failed to read file")?;
+
+    Ok(content)
+}
+
+async fn cap_fs_write(params: &serde_json::Value) -> Result<String> {
+    let path = params
+        .get("path")
+        .and_then(|v| v.as_str())
+        .context("Missing path parameter")?;
+    let content = params
+        .get("content")
+        .and_then(|v| v.as_str())
+        .context("Missing content parameter")?;
+
+    let path = expand_tilde(path);
+
+    // Create parent directories if they don't exist
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .context("Failed to create parent directories")?;
+    }
+
+    tokio::fs::write(&path, content)
+        .await
+        .context("Failed to write file")?;
+
+    Ok("OK".to_string())
+}
+
+async fn cap_fs_edit(params: &serde_json::Value) -> Result<String> {
+    let path = params
+        .get("path")
+        .and_then(|v| v.as_str())
+        .context("Missing path parameter")?;
+    let old_string = params
+        .get("old_string")
+        .and_then(|v| v.as_str())
+        .context("Missing old_string parameter")?;
+    let new_string = params
+        .get("new_string")
+        .and_then(|v| v.as_str())
+        .context("Missing new_string parameter")?;
+    let replace_all = params
+        .get("replace_all")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let path = expand_tilde(path);
+    let content = tokio::fs::read_to_string(&path)
+        .await
+        .context("Failed to read file")?;
+
+    // Exact match
+    let exact_count = content.matches(old_string).count();
+
+    if exact_count == 1 || (exact_count > 0 && replace_all) {
+        let result = if replace_all {
+            content.replace(old_string, new_string)
+        } else {
+            content.replacen(old_string, new_string, 1)
+        };
+        tokio::fs::write(&path, &result)
+            .await
+            .context("Failed to write file")?;
+        return Ok(format!(
+            "Edited {}. {} occurrence(s) replaced.",
+            path.display(),
+            if replace_all { exact_count } else { 1 }
+        ));
+    }
+
+    if exact_count > 1 && !replace_all {
+        bail!(
+            "old_string matches {} locations. Use replace_all or provide more context to make it unique.",
+            exact_count
+        );
+    }
+
+    // Whitespace-normalized fallback
+    let normalize = |s: &str| -> String {
+        s.lines()
+            .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let norm_old = normalize(old_string);
+    let norm_content = normalize(&content);
+    let norm_count = norm_content.matches(&norm_old).count();
+
+    if norm_count == 1 {
+        // Find the position in normalized content, then map back to original
+        let norm_pos = norm_content.find(&norm_old).unwrap();
+
+        // Map normalized position to original position by walking both strings
+        let mut orig_idx = 0;
+        let mut norm_idx = 0;
+        let content_bytes = content.as_bytes();
+        let norm_bytes = norm_content.as_bytes();
+
+        // Advance to the start position in both strings
+        while norm_idx < norm_pos {
+            // Skip extra whitespace in original that was collapsed
+            if content_bytes[orig_idx] == b'\n' && norm_bytes[norm_idx] == b'\n' {
+                orig_idx += 1;
+                norm_idx += 1;
+            } else if content_bytes[orig_idx].is_ascii_whitespace() && norm_bytes[norm_idx] == b' '
+            {
+                // Consume all whitespace in original for one space in normalized
+                norm_idx += 1;
+                while orig_idx < content.len()
+                    && content_bytes[orig_idx].is_ascii_whitespace()
+                    && content_bytes[orig_idx] != b'\n'
+                {
+                    orig_idx += 1;
+                }
+            } else {
+                orig_idx += 1;
+                norm_idx += 1;
+            }
         }
-        "fs_write" => {
-            let path = params
-                .get("path")
-                .and_then(|v| v.as_str())
-                .context("Missing path parameter")?;
-            let content = params
-                .get("content")
-                .and_then(|v| v.as_str())
-                .context("Missing content parameter")?;
+        let orig_start = orig_idx;
 
-            let path = expand_tilde(path);
+        // Now advance through the matched region
+        let norm_end = norm_pos + norm_old.len();
+        while norm_idx < norm_end {
+            if content_bytes[orig_idx] == b'\n' && norm_bytes[norm_idx] == b'\n' {
+                orig_idx += 1;
+                norm_idx += 1;
+            } else if content_bytes[orig_idx].is_ascii_whitespace() && norm_bytes[norm_idx] == b' '
+            {
+                norm_idx += 1;
+                while orig_idx < content.len()
+                    && content_bytes[orig_idx].is_ascii_whitespace()
+                    && content_bytes[orig_idx] != b'\n'
+                {
+                    orig_idx += 1;
+                }
+            } else {
+                orig_idx += 1;
+                norm_idx += 1;
+            }
+        }
+        let orig_end = orig_idx;
 
-            // Create parent directories if they don't exist
-            if let Some(parent) = path.parent() {
+        let mut result = String::with_capacity(content.len());
+        result.push_str(&content[..orig_start]);
+        result.push_str(new_string);
+        result.push_str(&content[orig_end..]);
+
+        tokio::fs::write(&path, &result)
+            .await
+            .context("Failed to write file")?;
+        return Ok(format!(
+            "Edited {} (matched with whitespace normalization).",
+            path.display()
+        ));
+    }
+
+    // No match — find closest match for error hint
+    let first_line = old_string
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or(old_string);
+    let old_line_count = old_string.lines().count();
+
+    let content_lines: Vec<&str> = content.lines().collect();
+    for (i, line) in content_lines.iter().enumerate() {
+        if line.contains(first_line.trim()) {
+            let start = i;
+            let end = (i + old_line_count).min(content_lines.len());
+            let context_snippet = content_lines[start..end].join("\n");
+            bail!(
+                "old_string not found. Closest match near line {}:\n{}",
+                i + 1,
+                context_snippet
+            );
+        }
+    }
+
+    bail!("old_string not found in {}", path.display());
+}
+
+async fn cap_fs_list(params: &serde_json::Value) -> Result<String> {
+    let path = params
+        .get("path")
+        .and_then(|v| v.as_str())
+        .context("Missing path parameter")?;
+    let path = expand_tilde(path);
+
+    let mut entries = tokio::fs::read_dir(&path)
+        .await
+        .context("Failed to read directory")?;
+
+    let mut items = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let metadata = entry.metadata().await?;
+        items.push(serde_json::json!({
+            "name": entry.file_name().to_string_lossy(),
+            "is_dir": metadata.is_dir(),
+            "size": metadata.len(),
+        }));
+    }
+
+    Ok(serde_json::to_string(&items)?)
+}
+
+async fn cap_fs_trash(params: &serde_json::Value) -> Result<String> {
+    let paths = get_paths(params)?;
+    for path in &paths {
+        trash::delete(path).with_context(|| format!("Failed to trash {}", path.display()))?;
+    }
+    Ok(serde_json::to_string(&serde_json::json!({
+        "trashed": paths.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>()
+    }))?)
+}
+
+async fn cap_fs_move(params: &serde_json::Value) -> Result<String> {
+    let destination = params
+        .get("destination")
+        .and_then(|v| v.as_str())
+        .context("Missing destination parameter")?;
+    let destination = expand_tilde(destination);
+    let paths = get_paths(params)?;
+
+    // If multiple sources, destination must be a directory
+    if paths.len() > 1 {
+        tokio::fs::create_dir_all(&destination)
+            .await
+            .context("Failed to create destination directory")?;
+    }
+
+    let mut moved = Vec::new();
+    for source in &paths {
+        let target = if destination.is_dir() || paths.len() > 1 {
+            let name = source.file_name().context("Source has no filename")?;
+            destination.join(name)
+        } else {
+            // Single source, destination is the full target path
+            if let Some(parent) = destination.parent() {
                 tokio::fs::create_dir_all(parent)
                     .await
                     .context("Failed to create parent directories")?;
             }
+            destination.clone()
+        };
+        tokio::fs::rename(source, &target).await.with_context(|| {
+            format!(
+                "Failed to move {} to {}",
+                source.display(),
+                target.display()
+            )
+        })?;
+        moved.push(serde_json::json!({
+            "from": source.to_string_lossy(),
+            "to": target.to_string_lossy(),
+        }));
+    }
+    Ok(serde_json::to_string(&moved)?)
+}
 
-            tokio::fs::write(&path, content)
+async fn cap_fs_rename(params: &serde_json::Value) -> Result<String> {
+    let items = params
+        .get("items")
+        .and_then(|v| v.as_array())
+        .context("Missing items parameter (expected array of {from, to})")?;
+
+    let mut renamed = Vec::new();
+    for item in items {
+        let from = item
+            .get("from")
+            .and_then(|v| v.as_str())
+            .context("Missing 'from' in rename item")?;
+        let to = item
+            .get("to")
+            .and_then(|v| v.as_str())
+            .context("Missing 'to' in rename item")?;
+        let from = expand_tilde(from);
+        let to = expand_tilde(to);
+
+        if let Some(parent) = to.parent() {
+            tokio::fs::create_dir_all(parent)
                 .await
-                .context("Failed to write file")?;
-
-            Ok("OK".to_string())
+                .context("Failed to create parent directories")?;
         }
-        "fs_edit" => {
-            let path = params
-                .get("path")
-                .and_then(|v| v.as_str())
-                .context("Missing path parameter")?;
-            let old_string = params
-                .get("old_string")
-                .and_then(|v| v.as_str())
-                .context("Missing old_string parameter")?;
-            let new_string = params
-                .get("new_string")
-                .and_then(|v| v.as_str())
-                .context("Missing new_string parameter")?;
-            let replace_all = params
-                .get("replace_all")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
 
-            let path = expand_tilde(path);
-            let content = tokio::fs::read_to_string(&path)
-                .await
-                .context("Failed to read file")?;
+        tokio::fs::rename(&from, &to)
+            .await
+            .with_context(|| format!("Failed to rename {} to {}", from.display(), to.display()))?;
+        renamed.push(serde_json::json!({
+            "from": from.to_string_lossy(),
+            "to": to.to_string_lossy(),
+        }));
+    }
+    Ok(serde_json::to_string(&renamed)?)
+}
 
-            // Exact match
-            let exact_count = content.matches(old_string).count();
+async fn cap_fs_search(params: &serde_json::Value) -> Result<String> {
+    let path = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+    let path = expand_tilde(path);
+    let pattern = params
+        .get("pattern")
+        .and_then(|v| v.as_str())
+        .context("Missing pattern parameter")?;
+    let max_results: usize = params
+        .get("max_results")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(100) as usize;
 
-            if exact_count == 1 || (exact_count > 0 && replace_all) {
-                let result = if replace_all {
-                    content.replace(old_string, new_string)
-                } else {
-                    content.replacen(old_string, new_string, 1)
-                };
-                tokio::fs::write(&path, &result)
+    let glob_pattern = glob::Pattern::new(pattern)
+        .with_context(|| format!("Invalid glob pattern: {}", pattern))?;
+
+    let mut results = Vec::new();
+    let walker = ignore::WalkBuilder::new(&path).hidden(false).build();
+
+    for entry in walker {
+        if results.len() >= max_results {
+            break;
+        }
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let name = entry.file_name().to_string_lossy();
+        if glob_pattern.matches(&name) {
+            let metadata = entry.metadata();
+            results.push(serde_json::json!({
+                "path": entry.path().to_string_lossy(),
+                "is_dir": metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false),
+                "size": metadata.as_ref().map(|m| m.len()).unwrap_or(0),
+            }));
+        }
+    }
+
+    Ok(serde_json::to_string(&results)?)
+}
+
+async fn cap_fs_grep(params: &serde_json::Value) -> Result<String> {
+    let pattern = params
+        .get("pattern")
+        .and_then(|v| v.as_str())
+        .context("Missing pattern parameter")?;
+    let path = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+    let path = expand_tilde(path);
+    let max_results: usize = params
+        .get("max_results")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(200) as usize;
+    let glob_filter = params.get("glob").and_then(|v| v.as_str());
+
+    // Use rg if available, fall back to grep
+    let mut cmd = if which_exists("rg") {
+        let mut c = tokio::process::Command::new("rg");
+        c.args(["--no-heading", "--line-number", "--color", "never"]);
+        c.arg("--max-count").arg(max_results.to_string());
+        if let Some(g) = glob_filter {
+            c.arg("--glob").arg(g);
+        }
+        c.arg(pattern).arg(&path);
+        c
+    } else {
+        let mut c = tokio::process::Command::new("grep");
+        c.args(["-rn", "--color=never"]);
+        if let Some(g) = glob_filter {
+            c.arg("--include").arg(g);
+        }
+        c.arg(pattern).arg(&path);
+        c
+    };
+
+    let output = cmd.output().await.context("Failed to run grep")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let matches: Vec<&str> = stdout.lines().take(max_results).collect();
+    Ok(serde_json::to_string(&serde_json::json!({
+        "matches": matches,
+        "count": matches.len(),
+        "truncated": stdout.lines().count() > max_results,
+    }))?)
+}
+
+async fn cap_fs_mkdir(params: &serde_json::Value) -> Result<String> {
+    let paths = get_paths(params)?;
+    for path in &paths {
+        tokio::fs::create_dir_all(path)
+            .await
+            .with_context(|| format!("Failed to create directory {}", path.display()))?;
+    }
+    Ok(serde_json::to_string(&serde_json::json!({
+        "created": paths.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>()
+    }))?)
+}
+
+async fn cap_fs_copy(params: &serde_json::Value) -> Result<String> {
+    let destination = params
+        .get("destination")
+        .and_then(|v| v.as_str())
+        .context("Missing destination parameter")?;
+    let destination = expand_tilde(destination);
+    let paths = get_paths(params)?;
+
+    if paths.len() > 1 {
+        tokio::fs::create_dir_all(&destination)
+            .await
+            .context("Failed to create destination directory")?;
+    }
+
+    let mut copied = Vec::new();
+    for source in &paths {
+        let target = if destination.is_dir() || paths.len() > 1 {
+            let name = source.file_name().context("Source has no filename")?;
+            destination.join(name)
+        } else {
+            if let Some(parent) = destination.parent() {
+                tokio::fs::create_dir_all(parent)
                     .await
-                    .context("Failed to write file")?;
-                return Ok(format!(
-                    "Edited {}. {} occurrence(s) replaced.",
-                    path.display(),
-                    if replace_all { exact_count } else { 1 }
-                ));
+                    .context("Failed to create parent directories")?;
             }
+            destination.clone()
+        };
 
-            if exact_count > 1 && !replace_all {
-                bail!(
-                    "old_string matches {} locations. Use replace_all or provide more context to make it unique.",
-                    exact_count
-                );
-            }
+        let metadata = tokio::fs::metadata(source)
+            .await
+            .with_context(|| format!("Failed to read {}", source.display()))?;
 
-            // Whitespace-normalized fallback
-            let normalize = |s: &str| -> String {
-                s.lines()
-                    .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
-
-            let norm_old = normalize(old_string);
-            let norm_content = normalize(&content);
-            let norm_count = norm_content.matches(&norm_old).count();
-
-            if norm_count == 1 {
-                // Find the position in normalized content, then map back to original
-                let norm_pos = norm_content.find(&norm_old).unwrap();
-
-                // Map normalized position to original position by walking both strings
-                let mut orig_idx = 0;
-                let mut norm_idx = 0;
-                let content_bytes = content.as_bytes();
-                let norm_bytes = norm_content.as_bytes();
-
-                // Advance to the start position in both strings
-                while norm_idx < norm_pos {
-                    // Skip extra whitespace in original that was collapsed
-                    if content_bytes[orig_idx] == b'\n' && norm_bytes[norm_idx] == b'\n' {
-                        orig_idx += 1;
-                        norm_idx += 1;
-                    } else if content_bytes[orig_idx].is_ascii_whitespace()
-                        && norm_bytes[norm_idx] == b' '
-                    {
-                        // Consume all whitespace in original for one space in normalized
-                        norm_idx += 1;
-                        while orig_idx < content.len()
-                            && content_bytes[orig_idx].is_ascii_whitespace()
-                            && content_bytes[orig_idx] != b'\n'
-                        {
-                            orig_idx += 1;
-                        }
-                    } else {
-                        orig_idx += 1;
-                        norm_idx += 1;
-                    }
-                }
-                let orig_start = orig_idx;
-
-                // Now advance through the matched region
-                let norm_end = norm_pos + norm_old.len();
-                while norm_idx < norm_end {
-                    if content_bytes[orig_idx] == b'\n' && norm_bytes[norm_idx] == b'\n' {
-                        orig_idx += 1;
-                        norm_idx += 1;
-                    } else if content_bytes[orig_idx].is_ascii_whitespace()
-                        && norm_bytes[norm_idx] == b' '
-                    {
-                        norm_idx += 1;
-                        while orig_idx < content.len()
-                            && content_bytes[orig_idx].is_ascii_whitespace()
-                            && content_bytes[orig_idx] != b'\n'
-                        {
-                            orig_idx += 1;
-                        }
-                    } else {
-                        orig_idx += 1;
-                        norm_idx += 1;
-                    }
-                }
-                let orig_end = orig_idx;
-
-                let mut result = String::with_capacity(content.len());
-                result.push_str(&content[..orig_start]);
-                result.push_str(new_string);
-                result.push_str(&content[orig_end..]);
-
-                tokio::fs::write(&path, &result)
-                    .await
-                    .context("Failed to write file")?;
-                return Ok(format!(
-                    "Edited {} (matched with whitespace normalization).",
-                    path.display()
-                ));
-            }
-
-            // No match — find closest match for error hint
-            let first_line = old_string
-                .lines()
-                .find(|l| !l.trim().is_empty())
-                .unwrap_or(old_string);
-            let old_line_count = old_string.lines().count();
-
-            let content_lines: Vec<&str> = content.lines().collect();
-            for (i, line) in content_lines.iter().enumerate() {
-                if line.contains(first_line.trim()) {
-                    let start = i;
-                    let end = (i + old_line_count).min(content_lines.len());
-                    let context_snippet = content_lines[start..end].join("\n");
-                    bail!(
-                        "old_string not found. Closest match near line {}:\n{}",
-                        i + 1,
-                        context_snippet
-                    );
-                }
-            }
-
-            bail!("old_string not found in {}", path.display());
+        if metadata.is_dir() {
+            copy_dir_recursive(source, &target).await.with_context(|| {
+                format!(
+                    "Failed to copy directory {} to {}",
+                    source.display(),
+                    target.display()
+                )
+            })?;
+        } else {
+            tokio::fs::copy(source, &target).await.with_context(|| {
+                format!(
+                    "Failed to copy {} to {}",
+                    source.display(),
+                    target.display()
+                )
+            })?;
         }
-        "fs_list" => {
-            let path = params
-                .get("path")
-                .and_then(|v| v.as_str())
-                .context("Missing path parameter")?;
-            let path = expand_tilde(path);
 
-            let mut entries = tokio::fs::read_dir(&path)
-                .await
-                .context("Failed to read directory")?;
+        copied.push(serde_json::json!({
+            "from": source.to_string_lossy(),
+            "to": target.to_string_lossy(),
+        }));
+    }
+    Ok(serde_json::to_string(&copied)?)
+}
 
-            let mut items = Vec::new();
-            while let Some(entry) = entries.next_entry().await? {
-                let metadata = entry.metadata().await?;
-                items.push(serde_json::json!({
-                    "name": entry.file_name().to_string_lossy(),
-                    "is_dir": metadata.is_dir(),
-                    "size": metadata.len(),
-                }));
-            }
+async fn cap_fs_open(params: &serde_json::Value) -> Result<String> {
+    let path = params
+        .get("path")
+        .and_then(|v| v.as_str())
+        .context("Missing path parameter")?;
+    let path = expand_tilde(path);
+    let app = params.get("app").and_then(|v| v.as_str());
 
-            Ok(serde_json::to_string(&items)?)
-        }
-        "fs_trash" => {
-            let paths = get_paths(params)?;
-            for path in &paths {
-                trash::delete(path)
-                    .with_context(|| format!("Failed to trash {}", path.display()))?;
-            }
-            Ok(serde_json::to_string(&serde_json::json!({
-                "trashed": paths.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>()
-            }))?)
-        }
-        "fs_move" => {
-            let destination = params
-                .get("destination")
-                .and_then(|v| v.as_str())
-                .context("Missing destination parameter")?;
-            let destination = expand_tilde(destination);
-            let paths = get_paths(params)?;
-
-            // If multiple sources, destination must be a directory
-            if paths.len() > 1 {
-                tokio::fs::create_dir_all(&destination)
-                    .await
-                    .context("Failed to create destination directory")?;
-            }
-
-            let mut moved = Vec::new();
-            for source in &paths {
-                let target = if destination.is_dir() || paths.len() > 1 {
-                    let name = source.file_name().context("Source has no filename")?;
-                    destination.join(name)
-                } else {
-                    // Single source, destination is the full target path
-                    if let Some(parent) = destination.parent() {
-                        tokio::fs::create_dir_all(parent)
-                            .await
-                            .context("Failed to create parent directories")?;
-                    }
-                    destination.clone()
-                };
-                tokio::fs::rename(source, &target).await.with_context(|| {
-                    format!(
-                        "Failed to move {} to {}",
-                        source.display(),
-                        target.display()
-                    )
-                })?;
-                moved.push(serde_json::json!({
-                    "from": source.to_string_lossy(),
-                    "to": target.to_string_lossy(),
-                }));
-            }
-            Ok(serde_json::to_string(&moved)?)
-        }
-        "fs_rename" => {
-            let items = params
-                .get("items")
-                .and_then(|v| v.as_array())
-                .context("Missing items parameter (expected array of {from, to})")?;
-
-            let mut renamed = Vec::new();
-            for item in items {
-                let from = item
-                    .get("from")
-                    .and_then(|v| v.as_str())
-                    .context("Missing 'from' in rename item")?;
-                let to = item
-                    .get("to")
-                    .and_then(|v| v.as_str())
-                    .context("Missing 'to' in rename item")?;
-                let from = expand_tilde(from);
-                let to = expand_tilde(to);
-
-                if let Some(parent) = to.parent() {
-                    tokio::fs::create_dir_all(parent)
-                        .await
-                        .context("Failed to create parent directories")?;
-                }
-
-                tokio::fs::rename(&from, &to).await.with_context(|| {
-                    format!("Failed to rename {} to {}", from.display(), to.display())
-                })?;
-                renamed.push(serde_json::json!({
-                    "from": from.to_string_lossy(),
-                    "to": to.to_string_lossy(),
-                }));
-            }
-            Ok(serde_json::to_string(&renamed)?)
-        }
-        "fs_search" => {
-            let path = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-            let path = expand_tilde(path);
-            let pattern = params
-                .get("pattern")
-                .and_then(|v| v.as_str())
-                .context("Missing pattern parameter")?;
-            let max_results: usize = params
-                .get("max_results")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(100) as usize;
-
-            let glob_pattern = glob::Pattern::new(pattern)
-                .with_context(|| format!("Invalid glob pattern: {}", pattern))?;
-
-            let mut results = Vec::new();
-            let walker = ignore::WalkBuilder::new(&path).hidden(false).build();
-
-            for entry in walker {
-                if results.len() >= max_results {
-                    break;
-                }
-                let entry = match entry {
-                    Ok(e) => e,
-                    Err(_) => continue,
-                };
-                let name = entry.file_name().to_string_lossy();
-                if glob_pattern.matches(&name) {
-                    let metadata = entry.metadata();
-                    results.push(serde_json::json!({
-                        "path": entry.path().to_string_lossy(),
-                        "is_dir": metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false),
-                        "size": metadata.as_ref().map(|m| m.len()).unwrap_or(0),
-                    }));
-                }
-            }
-
-            Ok(serde_json::to_string(&results)?)
-        }
-        "fs_grep" => {
-            let pattern = params
-                .get("pattern")
-                .and_then(|v| v.as_str())
-                .context("Missing pattern parameter")?;
-            let path = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-            let path = expand_tilde(path);
-            let max_results: usize = params
-                .get("max_results")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(200) as usize;
-            let glob_filter = params.get("glob").and_then(|v| v.as_str());
-
-            // Use rg if available, fall back to grep
-            let mut cmd = if which_exists("rg") {
-                let mut c = tokio::process::Command::new("rg");
-                c.args(["--no-heading", "--line-number", "--color", "never"]);
-                c.arg("--max-count").arg(max_results.to_string());
-                if let Some(g) = glob_filter {
-                    c.arg("--glob").arg(g);
-                }
-                c.arg(pattern).arg(&path);
-                c
-            } else {
-                let mut c = tokio::process::Command::new("grep");
-                c.args(["-rn", "--color=never"]);
-                if let Some(g) = glob_filter {
-                    c.arg("--include").arg(g);
-                }
-                c.arg(pattern).arg(&path);
-                c
-            };
-
-            let output = cmd.output().await.context("Failed to run grep")?;
-            let stdout = String::from_utf8_lossy(&output.stdout);
-
-            let matches: Vec<&str> = stdout.lines().take(max_results).collect();
-            Ok(serde_json::to_string(&serde_json::json!({
-                "matches": matches,
-                "count": matches.len(),
-                "truncated": stdout.lines().count() > max_results,
-            }))?)
-        }
-        "fs_mkdir" => {
-            let paths = get_paths(params)?;
-            for path in &paths {
-                tokio::fs::create_dir_all(path)
-                    .await
-                    .with_context(|| format!("Failed to create directory {}", path.display()))?;
-            }
-            Ok(serde_json::to_string(&serde_json::json!({
-                "created": paths.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>()
-            }))?)
-        }
-        "fs_copy" => {
-            let destination = params
-                .get("destination")
-                .and_then(|v| v.as_str())
-                .context("Missing destination parameter")?;
-            let destination = expand_tilde(destination);
-            let paths = get_paths(params)?;
-
-            if paths.len() > 1 {
-                tokio::fs::create_dir_all(&destination)
-                    .await
-                    .context("Failed to create destination directory")?;
-            }
-
-            let mut copied = Vec::new();
-            for source in &paths {
-                let target = if destination.is_dir() || paths.len() > 1 {
-                    let name = source.file_name().context("Source has no filename")?;
-                    destination.join(name)
-                } else {
-                    if let Some(parent) = destination.parent() {
-                        tokio::fs::create_dir_all(parent)
-                            .await
-                            .context("Failed to create parent directories")?;
-                    }
-                    destination.clone()
-                };
-
-                let metadata = tokio::fs::metadata(source)
-                    .await
-                    .with_context(|| format!("Failed to read {}", source.display()))?;
-
-                if metadata.is_dir() {
-                    copy_dir_recursive(source, &target).await.with_context(|| {
-                        format!(
-                            "Failed to copy directory {} to {}",
-                            source.display(),
-                            target.display()
-                        )
-                    })?;
-                } else {
-                    tokio::fs::copy(source, &target).await.with_context(|| {
-                        format!(
-                            "Failed to copy {} to {}",
-                            source.display(),
-                            target.display()
-                        )
-                    })?;
-                }
-
-                copied.push(serde_json::json!({
-                    "from": source.to_string_lossy(),
-                    "to": target.to_string_lossy(),
-                }));
-            }
-            Ok(serde_json::to_string(&copied)?)
-        }
-        "fs_open" => {
-            let path = params
-                .get("path")
-                .and_then(|v| v.as_str())
-                .context("Missing path parameter")?;
-            let path = expand_tilde(path);
-            let app = params.get("app").and_then(|v| v.as_str());
-
-            match app {
-                Some(app_name) => {
-                    #[cfg(target_os = "macos")]
-                    {
-                        let status = tokio::process::Command::new("open")
-                            .arg("-a")
-                            .arg(app_name)
-                            .arg(&path)
-                            .status()
-                            .await
-                            .context("Failed to run open")?;
-                        if !status.success() {
-                            anyhow::bail!("open -a '{}' failed", app_name);
-                        }
-                    }
-                    #[cfg(target_os = "windows")]
-                    {
-                        let status = tokio::process::Command::new("cmd")
-                            .args(["/C", "start", "", app_name, &path.to_string_lossy()])
-                            .status()
-                            .await
-                            .context("Failed to run start")?;
-                        if !status.success() {
-                            anyhow::bail!("start with '{}' failed", app_name);
-                        }
-                    }
-                    #[cfg(target_os = "linux")]
-                    {
-                        let status = tokio::process::Command::new(app_name)
-                            .arg(&path)
-                            .status()
-                            .await
-                            .with_context(|| format!("Failed to run '{}'", app_name))?;
-                        if !status.success() {
-                            anyhow::bail!("'{}' exited with error", app_name);
-                        }
-                    }
-                }
-                None => {
-                    open::that(&path)
-                        .with_context(|| format!("Failed to open {}", path.display()))?;
-                }
-            }
-
-            Ok(serde_json::json!({"opened": path.to_string_lossy()}).to_string())
-        }
-        "fs_reveal" => {
-            let path = params
-                .get("path")
-                .and_then(|v| v.as_str())
-                .context("Missing path parameter")?;
-            let path = expand_tilde(path);
-
+    match app {
+        Some(app_name) => {
             #[cfg(target_os = "macos")]
             {
                 let status = tokio::process::Command::new("open")
-                    .arg("-R")
+                    .arg("-a")
+                    .arg(app_name)
                     .arg(&path)
                     .status()
                     .await
-                    .context("Failed to reveal in Finder")?;
+                    .context("Failed to run open")?;
                 if !status.success() {
-                    anyhow::bail!("open -R failed");
+                    anyhow::bail!("open -a '{}' failed", app_name);
                 }
             }
             #[cfg(target_os = "windows")]
             {
-                let status = tokio::process::Command::new("explorer")
-                    .arg("/select,")
-                    .arg(&path)
+                let status = tokio::process::Command::new("cmd")
+                    .args(["/C", "start", "", app_name, &path.to_string_lossy()])
                     .status()
                     .await
-                    .context("Failed to reveal in Explorer")?;
+                    .context("Failed to run start")?;
                 if !status.success() {
-                    anyhow::bail!("explorer /select failed");
+                    anyhow::bail!("start with '{}' failed", app_name);
                 }
             }
             #[cfg(target_os = "linux")]
             {
-                // Try dbus (works on most modern desktops), fall back to xdg-open on parent
-                let dbus_result = tokio::process::Command::new("dbus-send")
-                    .args([
-                        "--dest=org.freedesktop.FileManager1",
-                        "--type=method_call",
-                        "/org/freedesktop/FileManager1",
-                        "org.freedesktop.FileManager1.ShowItems",
-                    ])
-                    .arg(format!("array:string:file://{}", path.display()))
-                    .arg("string:")
+                let status = tokio::process::Command::new(app_name)
+                    .arg(&path)
                     .status()
-                    .await;
-
-                match dbus_result {
-                    Ok(s) if s.success() => {}
-                    _ => {
-                        // Fall back to opening the parent directory
-                        let parent = path.parent().unwrap_or(&path);
-                        open::that(parent)
-                            .with_context(|| format!("Failed to open {}", parent.display()))?;
-                    }
+                    .await
+                    .with_context(|| format!("Failed to run '{}'", app_name))?;
+                if !status.success() {
+                    anyhow::bail!("'{}' exited with error", app_name);
                 }
             }
-
-            Ok(serde_json::json!({"revealed": path.to_string_lossy()}).to_string())
         }
-        "shell" => {
-            let command = params
-                .get("command")
-                .and_then(|v| v.as_str())
-                .context("Missing command parameter")?;
-            let cwd = params.get("cwd").and_then(|v| v.as_str());
-
-            let mut cmd = if cfg!(windows) {
-                let mut c = tokio::process::Command::new("cmd");
-                c.arg("/C").arg(command);
-                c
-            } else {
-                let mut c = tokio::process::Command::new("sh");
-                c.arg("-c").arg(command);
-                c
-            };
-
-            if let Some(cwd) = cwd {
-                cmd.current_dir(expand_tilde(cwd));
-            }
-
-            let output = cmd.output().await.context("Failed to execute command")?;
-
-            let result = serde_json::json!({
-                "stdout": String::from_utf8_lossy(&output.stdout),
-                "stderr": String::from_utf8_lossy(&output.stderr),
-                "exit_code": output.status.code(),
-            });
-
-            Ok(serde_json::to_string(&result)?)
+        None => {
+            open::that(&path).with_context(|| format!("Failed to open {}", path.display()))?;
         }
-        "md_file_to_pdf" => {
-            let path = params
-                .get("path")
-                .and_then(|v| v.as_str())
-                .context("Missing path parameter")?;
-            let output = params
-                .get("output")
-                .and_then(|v| v.as_str())
-                .context("Missing output parameter")?;
-
-            let path = expand_tilde(path);
-            let output = expand_tilde(output);
-
-            let content = tokio::fs::read_to_string(&path)
-                .await
-                .context("Failed to read markdown file")?;
-
-            let sans = params
-                .get("sans")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let pdf_bytes = convert_md_to_pdf(&content, sans)?;
-
-            if let Some(parent) = output.parent() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .context("Failed to create parent directories")?;
-            }
-
-            tokio::fs::write(&output, pdf_bytes)
-                .await
-                .context("Failed to write PDF")?;
-
-            Ok(format!("PDF written to {}", output.display()))
-        }
-        "md_to_pdf" => {
-            let markdown = params
-                .get("markdown")
-                .and_then(|v| v.as_str())
-                .context("Missing markdown parameter")?;
-            let output = params
-                .get("output")
-                .and_then(|v| v.as_str())
-                .context("Missing output parameter")?;
-
-            let output = expand_tilde(output);
-            let sans = params
-                .get("sans")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let pdf_bytes = convert_md_to_pdf(markdown, sans)?;
-
-            if let Some(parent) = output.parent() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .context("Failed to create parent directories")?;
-            }
-
-            tokio::fs::write(&output, pdf_bytes)
-                .await
-                .context("Failed to write PDF")?;
-
-            Ok(format!("PDF written to {}", output.display()))
-        }
-        "artifact_to_pdf" => {
-            let content = params
-                .get("content")
-                .and_then(|v| v.as_str())
-                .context("Missing content parameter")?;
-            let output = params
-                .get("output")
-                .and_then(|v| v.as_str())
-                .context("Missing output parameter")?;
-
-            let output = expand_tilde(output);
-            let sans = params
-                .get("sans")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let pdf_bytes = convert_md_to_pdf(content, sans)?;
-
-            if let Some(parent) = output.parent() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .context("Failed to create parent directories")?;
-            }
-
-            tokio::fs::write(&output, pdf_bytes)
-                .await
-                .context("Failed to write PDF")?;
-
-            Ok(format!("PDF written to {}", output.display()))
-        }
-        _ => bail!("Unknown capability: {}", capability),
     }
+
+    Ok(serde_json::json!({"opened": path.to_string_lossy()}).to_string())
+}
+
+async fn cap_fs_reveal(params: &serde_json::Value) -> Result<String> {
+    let path = params
+        .get("path")
+        .and_then(|v| v.as_str())
+        .context("Missing path parameter")?;
+    let path = expand_tilde(path);
+
+    #[cfg(target_os = "macos")]
+    {
+        let status = tokio::process::Command::new("open")
+            .arg("-R")
+            .arg(&path)
+            .status()
+            .await
+            .context("Failed to reveal in Finder")?;
+        if !status.success() {
+            anyhow::bail!("open -R failed");
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let status = tokio::process::Command::new("explorer")
+            .arg("/select,")
+            .arg(&path)
+            .status()
+            .await
+            .context("Failed to reveal in Explorer")?;
+        if !status.success() {
+            anyhow::bail!("explorer /select failed");
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Try dbus (works on most modern desktops), fall back to xdg-open on parent
+        let dbus_result = tokio::process::Command::new("dbus-send")
+            .args([
+                "--dest=org.freedesktop.FileManager1",
+                "--type=method_call",
+                "/org/freedesktop/FileManager1",
+                "org.freedesktop.FileManager1.ShowItems",
+            ])
+            .arg(format!("array:string:file://{}", path.display()))
+            .arg("string:")
+            .status()
+            .await;
+
+        match dbus_result {
+            Ok(s) if s.success() => {}
+            _ => {
+                // Fall back to opening the parent directory
+                let parent = path.parent().unwrap_or(&path);
+                open::that(parent)
+                    .with_context(|| format!("Failed to open {}", parent.display()))?;
+            }
+        }
+    }
+
+    Ok(serde_json::json!({"revealed": path.to_string_lossy()}).to_string())
+}
+
+// ============================================================================
+// Shell capability
+// ============================================================================
+
+async fn cap_shell(params: &serde_json::Value) -> Result<String> {
+    let command = params
+        .get("command")
+        .and_then(|v| v.as_str())
+        .context("Missing command parameter")?;
+    let cwd = params.get("cwd").and_then(|v| v.as_str());
+
+    let mut cmd = if cfg!(windows) {
+        let mut c = tokio::process::Command::new("cmd");
+        c.arg("/C").arg(command);
+        c
+    } else {
+        let mut c = tokio::process::Command::new("sh");
+        c.arg("-c").arg(command);
+        c
+    };
+
+    if let Some(cwd) = cwd {
+        cmd.current_dir(expand_tilde(cwd));
+    }
+
+    let output = cmd.output().await.context("Failed to execute command")?;
+
+    let result = serde_json::json!({
+        "stdout": String::from_utf8_lossy(&output.stdout),
+        "stderr": String::from_utf8_lossy(&output.stderr),
+        "exit_code": output.status.code(),
+    });
+
+    Ok(serde_json::to_string(&result)?)
+}
+
+// ============================================================================
+// PDF conversion capabilities
+// ============================================================================
+
+async fn cap_md_file_to_pdf(params: &serde_json::Value) -> Result<String> {
+    let path = params
+        .get("path")
+        .and_then(|v| v.as_str())
+        .context("Missing path parameter")?;
+    let output = params
+        .get("output")
+        .and_then(|v| v.as_str())
+        .context("Missing output parameter")?;
+
+    let path = expand_tilde(path);
+    let output = expand_tilde(output);
+
+    let content = tokio::fs::read_to_string(&path)
+        .await
+        .context("Failed to read markdown file")?;
+
+    let sans = params
+        .get("sans")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let pdf_bytes = convert_md_to_pdf(&content, sans)?;
+
+    write_pdf(&output, pdf_bytes).await
+}
+
+async fn cap_md_to_pdf(params: &serde_json::Value) -> Result<String> {
+    let markdown = params
+        .get("markdown")
+        .and_then(|v| v.as_str())
+        .context("Missing markdown parameter")?;
+    let output = params
+        .get("output")
+        .and_then(|v| v.as_str())
+        .context("Missing output parameter")?;
+
+    let output = expand_tilde(output);
+    let sans = params
+        .get("sans")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let pdf_bytes = convert_md_to_pdf(markdown, sans)?;
+
+    write_pdf(&output, pdf_bytes).await
+}
+
+async fn cap_artifact_to_pdf(params: &serde_json::Value) -> Result<String> {
+    let content = params
+        .get("content")
+        .and_then(|v| v.as_str())
+        .context("Missing content parameter")?;
+    let output = params
+        .get("output")
+        .and_then(|v| v.as_str())
+        .context("Missing output parameter")?;
+
+    let output = expand_tilde(output);
+    let sans = params
+        .get("sans")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let pdf_bytes = convert_md_to_pdf(content, sans)?;
+
+    write_pdf(&output, pdf_bytes).await
+}
+
+async fn write_pdf(output: &std::path::Path, pdf_bytes: Vec<u8>) -> Result<String> {
+    if let Some(parent) = output.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .context("Failed to create parent directories")?;
+    }
+
+    tokio::fs::write(output, pdf_bytes)
+        .await
+        .context("Failed to write PDF")?;
+
+    Ok(format!("PDF written to {}", output.display()))
 }
 
 fn convert_md_to_pdf(markdown: &str, sans: bool) -> Result<Vec<u8>> {

@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 permissions:
   contents: write
@@ -31,6 +31,10 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
       - name: Install cross-compilation tools
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
@@ -55,6 +59,8 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - uses: actions/download-artifact@v4

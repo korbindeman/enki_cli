@@ -239,56 +239,15 @@ pub fn logout() -> Result<()> {
     Ok(())
 }
 
-/// Exchange a refresh token for a JWT.
-/// The server rotates refresh tokens on each exchange, so we save the new one.
-pub async fn get_jwt(refresh_token: &str) -> Result<String> {
-    let url = format!("{}/api/auth/refresh", config::server_url());
-
+/// Validate credentials by hitting /auth/me with the refresh token directly
+async fn validate_credentials(creds: &Credentials) -> Result<bool> {
+    let url = format!("{}/api/auth/me", config::server_url());
     let client = reqwest::Client::new();
     let resp = client
-        .post(&url)
-        .json(&serde_json::json!({ "refresh_token": refresh_token }))
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", creds.refresh_token))
         .send()
         .await
         .context("Failed to connect to server")?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        bail!("Token refresh failed ({}): {}", status, body);
-    }
-
-    let body: serde_json::Value = resp.json().await?;
-    let jwt = body["jwt"]
-        .as_str()
-        .context("Missing jwt in response")?
-        .to_string();
-
-    // Server rotates the refresh token — save the new one
-    if let Some(new_refresh) = body["refresh_token"].as_str() {
-        if let Ok(Some(mut creds)) = config::load_credentials() {
-            creds.refresh_token = new_refresh.to_string();
-            let _ = config::save_credentials(&creds);
-        }
-    }
-
-    Ok(jwt)
-}
-
-/// Validate credentials by exchanging refresh token and hitting /auth/me
-async fn validate_credentials(creds: &Credentials) -> Result<bool> {
-    match get_jwt(&creds.refresh_token).await {
-        Ok(jwt) => {
-            let url = format!("{}/api/auth/me", config::server_url());
-            let client = reqwest::Client::new();
-            let resp = client
-                .get(&url)
-                .header("Authorization", format!("Bearer {}", jwt))
-                .send()
-                .await
-                .context("Failed to connect to server")?;
-            Ok(resp.status().is_success())
-        }
-        Err(_) => Ok(false),
-    }
+    Ok(resp.status().is_success())
 }
