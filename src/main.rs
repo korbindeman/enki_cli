@@ -32,6 +32,9 @@ enum Commands {
         /// Prevent the system from sleeping while the link is active
         #[arg(long)]
         persistent: bool,
+        /// List detected capabilities and exit
+        #[arg(long)]
+        list: bool,
     },
 }
 
@@ -48,8 +51,13 @@ async fn main() -> anyhow::Result<()> {
         Commands::Link {
             capabilities,
             persistent,
+            list,
         } => {
-            link::start(capabilities, persistent).await?;
+            if list {
+                link::list_capabilities(capabilities)?;
+            } else {
+                link::start(capabilities, persistent).await?;
+            }
         }
     }
 

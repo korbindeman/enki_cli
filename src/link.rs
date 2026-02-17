@@ -1,6 +1,7 @@
 //! Link command - connect this machine to Enki
 
 use anyhow::{bail, Context, Result};
+use colored::Colorize;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -10,22 +11,26 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use crate::claude_code::ClaudeCodeManager;
 use crate::config;
 
-/// Lock file guard - ensures only one `enki link` per machine.
+/// Lock file guard - ensures only one `enki link` per mode (dev/prod).
+/// Dev and prod links use separate lock files so they can run simultaneously.
 /// Removes the lock file when dropped.
 struct LinkLock {
     path: PathBuf,
 }
 
 impl LinkLock {
-    fn acquire() -> Result<Self> {
-        let path = config::config_dir()?.join("link.lock");
+    fn acquire(dev: bool) -> Result<Self> {
+        let lock_name = if dev { "link.dev.lock" } else { "link.lock" };
+        let path = config::config_dir()?.join(lock_name);
 
         if path.exists() {
             let contents = std::fs::read_to_string(&path).unwrap_or_default();
             if let Ok(pid) = contents.trim().parse::<u32>() {
                 if process_exists(pid) {
+                    let mode = if dev { "dev" } else { "prod" };
                     bail!(
-                        "Another enki link is already running (PID {}). Only one link per machine is allowed.",
+                        "Another enki link ({}) is already running (PID {}). Only one link per mode is allowed.",
+                        mode,
                         pid
                     );
                 }
@@ -173,34 +178,89 @@ enum DisconnectReason {
     ServerClosed,
 }
 
+/// List detected capabilities and exit
+pub fn list_capabilities(filter: Option<String>) -> Result<()> {
+    let capabilities = detect_capabilities(filter)?;
+    println!(
+        "{} {} capabilities detected:\n",
+        "●".green(),
+        capabilities.len().to_string().bold()
+    );
+    for cap in &capabilities {
+        let detail = match &cap.tools {
+            Some(tools) => {
+                let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+                format!(" ({})", names.join(", ").dimmed())
+            }
+            None => match &cap.paths {
+                Some(paths) => format!(" ({})", paths.join(", ").dimmed()),
+                None => String::new(),
+            },
+        };
+        println!("  {} {}{}", "·".dimmed(), cap.name.cyan(), detail);
+    }
+    Ok(())
+}
+
+/// Format a brief description of a capability execution from its params
+fn execution_summary(capability: &str, params: &serde_json::Value) -> String {
+    match capability {
+        "shell" => {
+            if let Some(cmd) = params.get("command").and_then(|v| v.as_str()) {
+                let truncated: String = cmd.chars().take(60).collect();
+                if cmd.len() > 60 {
+                    format!("{truncated}...")
+                } else {
+                    truncated
+                }
+            } else {
+                String::new()
+            }
+        }
+        cap if cap.starts_with("fs_") => {
+            if let Some(path) = params.get("path").and_then(|v| v.as_str()) {
+                path.to_string()
+            } else {
+                String::new()
+            }
+        }
+        _ => String::new(),
+    }
+}
+
 /// Start the link connection with automatic reconnection
 pub async fn start(capabilities_filter: Option<String>, persistent: bool) -> Result<()> {
-    let _lock = LinkLock::acquire()?;
-
     // Try dev auth first (server decides if dev mode is active)
-    let creds = match try_dev_credentials().await {
+    let (creds, is_dev) = match try_dev_credentials().await {
         Ok(creds) => {
             println!("Using dev credentials");
-            creds
+            (creds, true)
         }
-        Err(_) => match config::load_credentials()? {
-            Some(creds) => creds,
-            None => {
-                println!("Not authenticated. Starting login...\n");
-                crate::auth::login_flow().await?
-            }
-        },
+        Err(_) => {
+            let creds = match config::load_credentials()? {
+                Some(creds) => creds,
+                None => {
+                    println!("Not authenticated. Starting login...\n");
+                    crate::auth::login_flow().await?
+                }
+            };
+            (creds, false)
+        }
     };
 
-    println!("Connecting as {}...", creds.email);
+    // Dev and prod use separate lock files so both can run simultaneously
+    let _lock = LinkLock::acquire(is_dev)?;
+
+    println!("{} Connecting as {}...", "●".yellow(), creds.email.bold());
 
     // Detect capabilities
     let capabilities = detect_capabilities(capabilities_filter)?;
 
-    println!("Advertising {} capabilities:", capabilities.len());
-    for cap in &capabilities {
-        println!("  - {}", cap.name);
-    }
+    println!(
+        "{} Advertising {} capabilities",
+        "●".green(),
+        capabilities.len().to_string().bold()
+    );
 
     // Prevent system sleep if --persistent is set (held until dropped)
     let _awake_guard = if persistent {
@@ -209,7 +269,7 @@ pub async fn start(capabilities_filter: Option<String>, persistent: bool) -> Res
             .app_name("enki")
             .create()
             .context("Failed to inhibit system sleep")?;
-        println!("Persistent mode: system sleep inhibited");
+        println!("{} Persistent mode: system sleep inhibited", "●".cyan());
         Some(guard)
     } else {
         None
@@ -219,26 +279,31 @@ pub async fn start(capabilities_filter: Option<String>, persistent: bool) -> Res
     const MAX_BACKOFF_SECS: u64 = 30;
 
     loop {
-        // Load latest credentials from disk (may have been rotated)
-        let current_creds = config::load_credentials()?.unwrap_or_else(|| creds.clone());
+        // In dev mode, always use the dev credentials.
+        // In prod mode, reload from disk (may have been rotated).
+        let current_creds = if is_dev {
+            creds.clone()
+        } else {
+            config::load_credentials()?.unwrap_or_else(|| creds.clone())
+        };
 
         match run_connection(&current_creds, &capabilities).await {
             Ok((DisconnectReason::Transient(reason), was_connected)) => {
-                eprintln!("Disconnected: {}", reason);
+                eprintln!("{} Disconnected: {}", "●".red(), reason);
                 if was_connected {
                     backoff_secs = 1;
                 }
             }
             Ok((DisconnectReason::ServerClosed, _)) => {
-                println!("Connection closed by server.");
+                println!("{} Connection closed by server", "●".red());
                 backoff_secs = 1;
             }
             Err(e) => {
-                eprintln!("Connection failed: {}", e);
+                eprintln!("{} Connection failed: {}", "●".red(), e);
             }
         }
 
-        println!("Reconnecting in {}s...", backoff_secs);
+        println!("{} Reconnecting in {}s...", "●".yellow(), backoff_secs);
         tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
         backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
     }
@@ -262,7 +327,7 @@ async fn run_connection(
         .await
         .context("Failed to connect to Enki server")?;
 
-    println!("Connected!\n");
+    println!("{} Connected", "●".green());
 
     let (mut write, mut read) = ws_stream.split();
 
@@ -274,7 +339,7 @@ async fn run_connection(
         .send(Message::Text(serde_json::to_string(&announce)?))
         .await?;
 
-    println!("Link active. Press Ctrl+C to disconnect.\n");
+    println!("{} Link active. Press Ctrl+C to disconnect.\n", "●".green());
 
     // Channel for outgoing messages from ClaudeCodeManager
     let (cc_tx, mut cc_rx) = mpsc::unbounded_channel::<String>();
@@ -291,7 +356,12 @@ async fn run_connection(
                             Some(Ok(Message::Text(text))) => {
                                 match serde_json::from_str::<ServerMessage>(&text) {
                                     Ok(ServerMessage::Execute { request_id, capability, params }) => {
-                                        println!("[execute] {} with {:?}", capability, params);
+                                        let summary = execution_summary(&capability, &params);
+                                        if summary.is_empty() {
+                                            println!("  {} {}", "▸".cyan(), capability.bold());
+                                        } else {
+                                            println!("  {} {} {}", "▸".cyan(), capability.bold(), summary.dimmed());
+                                        }
 
                                         let result = execute_capability(&capability, &params).await;
 
@@ -314,40 +384,41 @@ async fn run_connection(
                                     }
                                     Ok(ServerMessage::Pong) => {}
                                     Ok(ServerMessage::Error { message }) => {
-                                        eprintln!("[error] {}", message);
+                                        eprintln!("  {} {}", "✗".red(), message);
                                     }
 
                                     // Claude Code session messages
                                     Ok(ServerMessage::CcStart { request_id, cwd, prompt }) => {
-                                        println!("[claude_code] Starting session: {}", &prompt[..prompt.len().min(60)]);
+                                        let truncated: String = prompt.chars().take(60).collect();
+                                        println!("  {} {} {}", "▸".cyan(), "claude_code".bold(), truncated.dimmed());
                                         if let Err(e) = cc_manager.start_session(request_id, cwd, prompt).await {
-                                            eprintln!("[claude_code] Failed to start session: {}", e);
+                                            eprintln!("  {} {}", "✗".red(), e);
                                         }
                                     }
                                     Ok(ServerMessage::CcPrompt { session_id, prompt }) => {
-                                        println!("[claude_code] Follow-up prompt for {}", session_id);
+                                        println!("  {} {} {}", "▸".cyan(), "claude_code".bold(), format!("follow-up {}", &session_id[..8.min(session_id.len())]).dimmed());
                                         if let Err(e) = cc_manager.send_prompt(&session_id, prompt).await {
-                                            eprintln!("[claude_code] Failed to send prompt: {}", e);
+                                            eprintln!("  {} {}", "✗".red(), e);
                                         }
                                     }
                                     Ok(ServerMessage::CcPermissionResponse { session_id: _, permission_id, approved }) => {
                                         cc_manager.handle_permission_response(&permission_id, approved);
                                     }
                                     Ok(ServerMessage::CcCancel { session_id }) => {
-                                        println!("[claude_code] Cancelling session {}", session_id);
+                                        println!("  {} {} {}", "▸".cyan(), "claude_code".bold(), "cancel".dimmed());
                                         if let Err(e) = cc_manager.cancel_session(&session_id).await {
-                                            eprintln!("[claude_code] Failed to cancel: {}", e);
+                                            eprintln!("  {} {}", "✗".red(), e);
                                         }
                                     }
                                     Ok(ServerMessage::CcInterrupt { session_id }) => {
-                                        println!("[claude_code] Interrupting session {}", session_id);
+                                        println!("  {} {} {}", "▸".cyan(), "claude_code".bold(), "interrupt".dimmed());
                                         if let Err(e) = cc_manager.interrupt_session(&session_id).await {
-                                            eprintln!("[claude_code] Failed to interrupt: {}", e);
+                                            eprintln!("  {} {}", "✗".red(), e);
                                         }
                                     }
 
                                     Err(e) => {
-                                        eprintln!("[parse error] {}: {}", e, text);
+                                        eprintln!("  {} Parse error: {}", "✗".red(), e);
                                     }
                                 }
                             }

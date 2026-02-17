@@ -1,6 +1,6 @@
 [package]
 name = "enki"
-version = "0.1.8"
+version = "0.1.9"
 authors = ["Korbin de Man <korbindeman4@gmail.com>"]
 edition = "2021"
 description = "CLI for Enki - Link your machine to the Enki AI assistant"
@@ -29,6 +29,9 @@ serde_json = "1"
 agent-client-protocol = "0.9"
 tokio-util = { version = "0.7", features = ["compat"] }
 async-trait = "0.1"
+
+# TUI
+colored = "2"
 
 # Utils
 dirs = "5"
