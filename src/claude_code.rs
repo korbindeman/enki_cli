@@ -129,7 +129,7 @@ impl ClaudeCodeManager {
             .arg("@zed-industries/claude-code-acp")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::null())
             .kill_on_drop(true)
             .spawn()
             .context("Failed to spawn claude-code-acp")?;

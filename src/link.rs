@@ -336,7 +336,7 @@ async fn run_connection(
         capabilities: capabilities.to_vec(),
     };
     write
-        .send(Message::Text(serde_json::to_string(&announce)?))
+        .send(Message::Text(serde_json::to_string(&announce)?.into()))
         .await?;
 
     println!("{} Link active. Press Ctrl+C to disconnect.\n", "●".green());
@@ -380,7 +380,7 @@ async fn run_connection(
                                             },
                                         };
 
-                                        write.send(Message::Text(serde_json::to_string(&response)?)).await?;
+                                        write.send(Message::Text(serde_json::to_string(&response)?.into())).await?;
                                     }
                                     Ok(ServerMessage::Pong) => {}
                                     Ok(ServerMessage::Error { message }) => {
@@ -437,12 +437,12 @@ async fn run_connection(
 
                     // Outgoing messages from ClaudeCodeManager
                     Some(msg) = cc_rx.recv() => {
-                        write.send(Message::Text(msg)).await?;
+                        write.send(Message::Text(msg.into())).await?;
                     }
 
                     // Send periodic ping
                     _ = tokio::time::sleep(tokio::time::Duration::from_secs(30)) => {
-                        write.send(Message::Text(serde_json::to_string(&ClientMessage::Ping)?)).await?;
+                        write.send(Message::Text(serde_json::to_string(&ClientMessage::Ping)?.into())).await?;
                     }
                 }
             }

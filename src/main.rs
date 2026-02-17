@@ -24,6 +24,8 @@ enum Commands {
     Logout,
     /// Show login status and detected capabilities
     Status,
+    /// Check for updates and install the latest version
+    Update,
     /// Link this machine to Enki (requires authentication)
     Link {
         /// Limit advertised capabilities (comma-separated: fs,shell,toolchain)
@@ -48,6 +50,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Login => auth::login().await?,
         Commands::Logout => auth::logout()?,
         Commands::Status => auth::status().await?,
+        Commands::Update => update::run().await?,
         Commands::Link {
             capabilities,
             persistent,
