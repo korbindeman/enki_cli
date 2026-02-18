@@ -2,8 +2,7 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches: [main]
 
 permissions:
   contents: write
@@ -26,6 +25,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Fetch tags
+        run: git fetch --tags
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -51,13 +53,24 @@ jobs:
           tar czf ../../../enki-${{ matrix.target }}.tar.gz enki
           cd ../../..
 
+      - name: Get tag
+        id: tag
+        run: |
+          TAG=$(git tag --points-at HEAD | grep '^v' | head -n1)
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
       - uses: actions/upload-artifact@v4
+        if: steps.tag.outputs.tag != ''
         with:
           name: enki-${{ matrix.target }}
           path: enki-${{ matrix.target }}.tar.gz
 
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+
   release:
     needs: build
+    if: needs.build.outputs.tag != ''
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -70,5 +83,6 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.build.outputs.tag }}
           files: enki-*.tar.gz
           generate_release_notes: true
