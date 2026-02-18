@@ -380,7 +380,13 @@ async fn run_connection(creds: &config::Credentials, capabilities: &[Capability]
             let mut cc_manager: Option<ClaudeCodeManager> = None;
 
             while let Some(chunk_result) = byte_stream.next().await {
-                let chunk = chunk_result.context("Stream read error")?;
+                let chunk = match chunk_result {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("{} Stream error: {}", "✗".red(), e);
+                        break;
+                    }
+                };
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
 
                 // Process complete lines from the buffer
