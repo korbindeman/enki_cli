@@ -3,7 +3,6 @@
 use anyhow::{bail, Context, Result};
 use colored::Colorize;
 use futures_util::StreamExt;
-use reqwest_eventsource::{Event, EventSource};
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -338,6 +337,12 @@ pub async fn start(capabilities_filter: Option<String>, persistent: bool) -> Res
     }
 }
 
+/// A parsed SSE event
+struct SseEvent {
+    event: String,
+    data: String,
+}
+
 /// Run a single SSE connection. Returns Ok(true) if was connected before disconnect.
 async fn run_connection(creds: &config::Credentials, capabilities: &[Capability]) -> Result<bool> {
     let sse_url = format!(
@@ -347,8 +352,26 @@ async fn run_connection(creds: &config::Credentials, capabilities: &[Capability]
     );
 
     let link_client = Arc::new(LinkClient::new(&creds.refresh_token));
-    let mut es = EventSource::get(&sse_url);
+
+    let resp = link_client
+        .client
+        .get(&sse_url)
+        .header("Accept", "text/event-stream")
+        .send()
+        .await
+        .context("Failed to connect to SSE endpoint")?;
+
+    if !resp.status().is_success() {
+        bail!("SSE connection failed with status {}", resp.status());
+    }
+
     let mut was_connected = false;
+
+    // Stream the response body line by line for SSE parsing
+    let mut byte_stream = resp.bytes_stream();
+    let mut buffer = String::new();
+    let mut current_event = String::new();
+    let mut current_data: Vec<String> = Vec::new();
 
     // Wrap in LocalSet since ACP futures are !Send
     let local = tokio::task::LocalSet::new();
@@ -356,126 +379,48 @@ async fn run_connection(creds: &config::Credentials, capabilities: &[Capability]
         .run_until(async {
             let mut cc_manager: Option<ClaudeCodeManager> = None;
 
-            while let Some(event) = es.next().await {
-                match event {
-                    Ok(Event::Open) => {
-                        // SSE connection opened, wait for connected event
-                    }
-                    Ok(Event::Message(msg)) => {
-                        match msg.event.as_str() {
-                            "connected" => {
-                                let data: ConnectedEvent = serde_json::from_str(&msg.data)
-                                    .context("Bad connected event")?;
+            while let Some(chunk_result) = byte_stream.next().await {
+                let chunk = chunk_result.context("Stream read error")?;
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
 
-                                was_connected = true;
-                                println!("{} Connected", "●".green());
+                // Process complete lines from the buffer
+                while let Some(newline_pos) = buffer.find('\n') {
+                    let line = buffer[..newline_pos].trim_end_matches('\r').to_string();
+                    buffer = buffer[newline_pos + 1..].to_string();
 
-                                // Announce capabilities
-                                link_client
-                                    .announce(&data.connection_id, capabilities)
-                                    .await?;
-
-                                // Create ClaudeCodeManager with the link client
-                                cc_manager = Some(ClaudeCodeManager::new(link_client.clone()));
-
-                                println!(
-                                    "{} Link active. Press Ctrl+C to disconnect.\n",
-                                    "●".green()
-                                );
-                            }
-                            "execute" => {
-                                let data: ExecuteEvent =
-                                    serde_json::from_str(&msg.data).context("Bad execute event")?;
-
-                                let summary = execution_summary(&data.capability, &data.params);
-                                if summary.is_empty() {
-                                    println!("  {} {}", "▸".cyan(), data.capability.bold());
+                    if line.is_empty() {
+                        // Empty line = event boundary
+                        if !current_data.is_empty() {
+                            let event = SseEvent {
+                                event: if current_event.is_empty() {
+                                    "message".to_string()
                                 } else {
-                                    println!(
-                                        "  {} {} {}",
-                                        "▸".cyan(),
-                                        data.capability.bold(),
-                                        summary.dimmed()
-                                    );
-                                }
+                                    std::mem::take(&mut current_event)
+                                },
+                                data: current_data.join("\n"),
+                            };
+                            current_data.clear();
 
-                                let client = link_client.clone();
-                                let request_id = data.request_id;
-                                let capability = data.capability;
-                                let params = data.params;
-
-                                tokio::task::spawn_local(async move {
-                                    let result = execute_capability(&capability, &params).await;
-
-                                    let post_result = match result {
-                                        Ok(result_data) => {
-                                            client
-                                                .send_result(
-                                                    &request_id,
-                                                    "success",
-                                                    Some(result_data),
-                                                    None,
-                                                )
-                                                .await
-                                        }
-                                        Err(e) => {
-                                            client
-                                                .send_result(
-                                                    &request_id,
-                                                    "error",
-                                                    None,
-                                                    Some(e.to_string()),
-                                                )
-                                                .await
-                                        }
-                                    };
-
-                                    if let Err(e) = post_result {
-                                        eprintln!("  {} Failed to post result: {}", "✗".red(), e);
-                                    }
-                                });
-                            }
-                            "cc_start" => {
-                                let data: CcStartEvent = serde_json::from_str(&msg.data)
-                                    .context("Bad cc_start event")?;
-
-                                let truncated: String = data.prompt.chars().take(60).collect();
-                                println!(
-                                    "  {} {} {}",
-                                    "▸".cyan(),
-                                    "claude_code".bold(),
-                                    truncated.dimmed()
-                                );
-
-                                if let Some(ref mgr) = cc_manager {
-                                    if let Err(e) = mgr
-                                        .start_session(data.request_id, data.cwd, data.prompt)
-                                        .await
-                                    {
-                                        eprintln!("  {} {}", "✗".red(), e);
-                                    }
-                                }
-                            }
-                            "cc_message" => {
-                                let data: serde_json::Value = serde_json::from_str(&msg.data)
-                                    .context("Bad cc_message event")?;
-
-                                if let Some(ref mgr) = cc_manager {
-                                    handle_cc_message(mgr, &data).await;
-                                }
-                            }
-                            _ => {
-                                // Unknown event type, ignore
+                            if let Err(e) = handle_sse_event(
+                                &event,
+                                &link_client,
+                                capabilities,
+                                &mut cc_manager,
+                                &mut was_connected,
+                            )
+                            .await
+                            {
+                                eprintln!("  {} Event error: {}", "✗".red(), e);
                             }
                         }
+                    } else if let Some(value) = line.strip_prefix("event:") {
+                        current_event = value.trim().to_string();
+                    } else if let Some(value) = line.strip_prefix("data:") {
+                        current_data.push(value.trim_start().to_string());
+                    } else if line.starts_with(':') {
+                        // Comment (keepalive), ignore
                     }
-                    Err(reqwest_eventsource::Error::StreamEnded) => {
-                        break;
-                    }
-                    Err(e) => {
-                        eprintln!("{} SSE error: {}", "✗".red(), e);
-                        break;
-                    }
+                    // id: lines ignored for now
                 }
             }
 
@@ -483,8 +428,108 @@ async fn run_connection(creds: &config::Credentials, capabilities: &[Capability]
         })
         .await;
 
-    es.close();
     result
+}
+
+/// Handle a single parsed SSE event
+async fn handle_sse_event(
+    event: &SseEvent,
+    link_client: &Arc<LinkClient>,
+    capabilities: &[Capability],
+    cc_manager: &mut Option<ClaudeCodeManager>,
+    was_connected: &mut bool,
+) -> Result<()> {
+    match event.event.as_str() {
+        "connected" => {
+            let data: ConnectedEvent =
+                serde_json::from_str(&event.data).context("Bad connected event")?;
+
+            *was_connected = true;
+            println!("{} Connected", "●".green());
+
+            link_client
+                .announce(&data.connection_id, capabilities)
+                .await?;
+
+            *cc_manager = Some(ClaudeCodeManager::new(link_client.clone()));
+
+            println!("{} Link active. Press Ctrl+C to disconnect.\n", "●".green());
+        }
+        "execute" => {
+            let data: ExecuteEvent =
+                serde_json::from_str(&event.data).context("Bad execute event")?;
+
+            let summary = execution_summary(&data.capability, &data.params);
+            if summary.is_empty() {
+                println!("  {} {}", "▸".cyan(), data.capability.bold());
+            } else {
+                println!(
+                    "  {} {} {}",
+                    "▸".cyan(),
+                    data.capability.bold(),
+                    summary.dimmed()
+                );
+            }
+
+            let client = link_client.clone();
+            let request_id = data.request_id;
+            let capability = data.capability;
+            let params = data.params;
+
+            tokio::task::spawn_local(async move {
+                let result = execute_capability(&capability, &params).await;
+
+                let post_result = match result {
+                    Ok(result_data) => {
+                        client
+                            .send_result(&request_id, "success", Some(result_data), None)
+                            .await
+                    }
+                    Err(e) => {
+                        client
+                            .send_result(&request_id, "error", None, Some(e.to_string()))
+                            .await
+                    }
+                };
+
+                if let Err(e) = post_result {
+                    eprintln!("  {} Failed to post result: {}", "✗".red(), e);
+                }
+            });
+        }
+        "cc_start" => {
+            let data: CcStartEvent =
+                serde_json::from_str(&event.data).context("Bad cc_start event")?;
+
+            let truncated: String = data.prompt.chars().take(60).collect();
+            println!(
+                "  {} {} {}",
+                "▸".cyan(),
+                "claude_code".bold(),
+                truncated.dimmed()
+            );
+
+            if let Some(ref mgr) = cc_manager {
+                if let Err(e) = mgr
+                    .start_session(data.request_id, data.cwd, data.prompt)
+                    .await
+                {
+                    eprintln!("  {} {}", "✗".red(), e);
+                }
+            }
+        }
+        "cc_message" => {
+            let data: serde_json::Value =
+                serde_json::from_str(&event.data).context("Bad cc_message event")?;
+
+            if let Some(ref mgr) = cc_manager {
+                handle_cc_message(mgr, &data).await;
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
 }
 
 /// Handle incoming Claude Code messages from the server

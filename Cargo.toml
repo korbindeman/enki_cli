@@ -1,6 +1,6 @@
 [package]
 name = "enki"
-version = "0.1.11"
+version = "0.1.12"
 authors = ["Korbin de Man <korbindeman4@gmail.com>"]
 edition = "2021"
 description = "CLI for Enki - Link your machine to the Enki AI assistant"
@@ -17,8 +17,7 @@ clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 
 # HTTP/SSE
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
-reqwest-eventsource = "0.6"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 futures-util = "0.3"
 
 # Serialization
