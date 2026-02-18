@@ -383,7 +383,11 @@ async fn run_connection(creds: &config::Credentials, capabilities: &[Capability]
                 let chunk = match chunk_result {
                     Ok(c) => c,
                     Err(e) => {
-                        eprintln!("{} Stream error: {}", "✗".red(), e);
+                        if !was_connected {
+                            // First connection failed — surface the actual error
+                            anyhow::bail!("Stream error: {}", e);
+                        }
+                        // Already connected — this is just a disconnect, not an error
                         break;
                     }
                 };
