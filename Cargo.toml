@@ -1,6 +1,6 @@
 [package]
 name = "enki"
-version = "0.1.10"
+version = "0.1.11"
 authors = ["Korbin de Man <korbindeman4@gmail.com>"]
 edition = "2021"
 description = "CLI for Enki - Link your machine to the Enki AI assistant"
@@ -16,9 +16,9 @@ clap = { version = "4", features = ["derive"] }
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
-# HTTP/WebSocket
+# HTTP/SSE
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
-tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+reqwest-eventsource = "0.6"
 futures-util = "0.3"
 
 # Serialization

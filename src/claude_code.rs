@@ -7,12 +7,14 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use agent_client_protocol as acp;
 use anyhow::{Context, Result};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+
+use crate::link::LinkClient;
 
 /// Supported package managers for installing/running the ACP adapter.
 #[derive(Debug, Clone, Copy)]
@@ -86,16 +88,16 @@ pub struct ClaudeCodeManager {
     sessions: Rc<RefCell<HashMap<String, SessionHandle>>>,
     /// Pending permission requests: permission_id → oneshot sender for the approved/denied response
     permission_channels: Rc<RefCell<HashMap<String, oneshot::Sender<bool>>>>,
-    /// Channel to send messages back to the Enki server via WebSocket
-    ws_tx: mpsc::UnboundedSender<String>,
+    /// HTTP client for posting messages back to the Enki server
+    link_client: Arc<LinkClient>,
 }
 
 impl ClaudeCodeManager {
-    pub fn new(ws_tx: mpsc::UnboundedSender<String>) -> Self {
+    pub fn new(link_client: Arc<LinkClient>) -> Self {
         Self {
             sessions: Rc::new(RefCell::new(HashMap::new())),
             permission_channels: Rc::new(RefCell::new(HashMap::new())),
-            ws_tx,
+            link_client,
         }
     }
 
@@ -140,7 +142,7 @@ impl ClaudeCodeManager {
         // Create ACP client that forwards updates to the server
         let client = EnkiAcpClient {
             session_id: RefCell::new(String::new()), // Will be set after session creation
-            ws_tx: self.ws_tx.clone(),
+            link_client: self.link_client.clone(),
             permission_channels: self.permission_channels.clone(),
         };
 
@@ -182,14 +184,15 @@ impl ClaudeCodeManager {
         let session_id = session_resp.session_id.to_string();
 
         // Notify server that the session started
-        send_to_server(
-            &self.ws_tx,
+        post_cc_message(
+            &self.link_client,
             &serde_json::json!({
                 "type": "cc_session_started",
                 "request_id": request_id,
                 "session_id": session_id,
             }),
-        );
+        )
+        .await;
 
         // Store the session handle
         self.sessions.borrow_mut().insert(
@@ -202,7 +205,7 @@ impl ClaudeCodeManager {
         );
 
         // Send initial prompt (async — updates stream via session_notification)
-        let ws_tx = self.ws_tx.clone();
+        let client = self.link_client.clone();
         let sid = session_id.clone();
         tokio::task::spawn_local(async move {
             match acp::Agent::prompt(
@@ -215,25 +218,27 @@ impl ClaudeCodeManager {
             .await
             {
                 Ok(resp) => {
-                    send_to_server(
-                        &ws_tx,
+                    post_cc_message(
+                        &client,
                         &serde_json::json!({
                             "type": "cc_prompt_done",
                             "session_id": sid,
                             "stop_reason": format!("{:?}", resp.stop_reason),
                         }),
-                    );
+                    )
+                    .await;
                 }
                 Err(e) => {
-                    send_to_server(
-                        &ws_tx,
+                    post_cc_message(
+                        &client,
                         &serde_json::json!({
                             "type": "cc_error",
                             "session_id": sid,
                             "request_id": request_id,
                             "error": e.to_string(),
                         }),
-                    );
+                    )
+                    .await;
                 }
             }
         });
@@ -249,7 +254,7 @@ impl ClaudeCodeManager {
             handle.conn.clone()
         };
 
-        let ws_tx = self.ws_tx.clone();
+        let client = self.link_client.clone();
         let sid = session_id.to_string();
         tokio::task::spawn_local(async move {
             match acp::Agent::prompt(
@@ -262,24 +267,26 @@ impl ClaudeCodeManager {
             .await
             {
                 Ok(resp) => {
-                    send_to_server(
-                        &ws_tx,
+                    post_cc_message(
+                        &client,
                         &serde_json::json!({
                             "type": "cc_prompt_done",
                             "session_id": sid,
                             "stop_reason": format!("{:?}", resp.stop_reason),
                         }),
-                    );
+                    )
+                    .await;
                 }
                 Err(e) => {
-                    send_to_server(
-                        &ws_tx,
+                    post_cc_message(
+                        &client,
                         &serde_json::json!({
                             "type": "cc_error",
                             "session_id": sid,
                             "error": e.to_string(),
                         }),
-                    );
+                    )
+                    .await;
                 }
             }
         });
@@ -349,7 +356,7 @@ impl ClaudeCodeManager {
 /// Permission requests and streaming updates go to the server for mediation.
 struct EnkiAcpClient {
     session_id: RefCell<String>,
-    ws_tx: mpsc::UnboundedSender<String>,
+    link_client: Arc<LinkClient>,
     permission_channels: Rc<RefCell<HashMap<String, oneshot::Sender<bool>>>>,
 }
 
@@ -373,8 +380,8 @@ impl acp::Client for EnkiAcpClient {
         let input = serde_json::to_value(&args.tool_call).unwrap_or_default();
 
         // Send permission request to server
-        send_to_server(
-            &self.ws_tx,
+        post_cc_message(
+            &self.link_client,
             &serde_json::json!({
                 "type": "cc_permission_request",
                 "session_id": session_id,
@@ -382,7 +389,8 @@ impl acp::Client for EnkiAcpClient {
                 "tool_name": tool_name,
                 "input": input,
             }),
-        );
+        )
+        .await;
 
         // Create channel and wait for response
         let (tx, rx) = oneshot::channel();
@@ -463,15 +471,16 @@ impl acp::Client for EnkiAcpClient {
             _ => return Ok(()),
         };
 
-        send_to_server(
-            &self.ws_tx,
+        post_cc_message(
+            &self.link_client,
             &serde_json::json!({
                 "type": "cc_update",
                 "session_id": session_id,
                 "update_type": update_type,
                 "data": data,
             }),
-        );
+        )
+        .await;
 
         Ok(())
     }
@@ -515,8 +524,10 @@ impl acp::Client for EnkiAcpClient {
     }
 }
 
-fn send_to_server(tx: &mpsc::UnboundedSender<String>, msg: &serde_json::Value) {
-    let _ = tx.send(serde_json::to_string(msg).unwrap_or_default());
+async fn post_cc_message(client: &LinkClient, msg: &serde_json::Value) {
+    if let Err(e) = client.post("/api/link/cc", msg).await {
+        eprintln!("[claude_code] Failed to post CC message: {}", e);
+    }
 }
 
 const ACP_ADAPTER_PACKAGE: &str = "@zed-industries/claude-code-acp";

@@ -2,11 +2,11 @@
 
 use anyhow::{bail, Context, Result};
 use colored::Colorize;
-use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
+use futures_util::StreamExt;
+use reqwest_eventsource::{Event, EventSource};
+use serde::Deserialize;
 use std::path::PathBuf;
-use tokio::sync::mpsc;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use std::sync::Arc;
 
 use crate::claude_code::ClaudeCodeManager;
 use crate::config;
@@ -74,61 +74,8 @@ fn process_exists(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
-/// Messages sent from CLI to server
-#[derive(Debug, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ClientMessage {
-    /// Announce capabilities on connect
-    Announce { capabilities: Vec<Capability> },
-    /// Result of capability execution
-    Result {
-        request_id: String,
-        status: String,
-        data: Option<String>,
-        error: Option<String>,
-    },
-    /// Heartbeat
-    Ping,
-}
-
-/// Messages sent from server to CLI
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ServerMessage {
-    /// Execute a capability
-    Execute {
-        request_id: String,
-        capability: String,
-        params: serde_json::Value,
-    },
-    /// Heartbeat response
-    Pong,
-    /// Error
-    Error { message: String },
-
-    // Claude Code session messages
-    /// Start a new Claude Code session
-    CcStart {
-        request_id: String,
-        cwd: String,
-        prompt: String,
-    },
-    /// Send a follow-up prompt to an existing session
-    CcPrompt { session_id: String, prompt: String },
-    /// Respond to a permission request
-    CcPermissionResponse {
-        session_id: String,
-        permission_id: String,
-        approved: bool,
-    },
-    /// Cancel a session
-    CcCancel { session_id: String },
-    /// Interrupt current prompt (cancel without destroying session)
-    CcInterrupt { session_id: String },
-}
-
 /// A capability this machine can provide
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Capability {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -137,10 +84,100 @@ pub struct Capability {
     pub tools: Option<Vec<Tool>>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Tool {
     pub name: String,
     pub version: String,
+}
+
+/// HTTP client for posting results back to the server.
+#[derive(Clone)]
+pub struct LinkClient {
+    client: reqwest::Client,
+    base_url: String,
+    token: String,
+}
+
+impl LinkClient {
+    fn new(token: &str) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            base_url: config::server_url(),
+            token: token.to_string(),
+        }
+    }
+
+    /// POST JSON to a link endpoint. Returns Ok(()) on success.
+    pub async fn post(&self, path: &str, body: &serde_json::Value) -> Result<()> {
+        let url = format!("{}{}", self.base_url, path);
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(body)
+            .send()
+            .await
+            .context("POST failed")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            bail!("POST {} failed ({}): {}", path, status, text);
+        }
+
+        Ok(())
+    }
+
+    async fn announce(&self, connection_id: &str, capabilities: &[Capability]) -> Result<()> {
+        self.post(
+            "/api/link/announce",
+            &serde_json::json!({
+                "connection_id": connection_id,
+                "capabilities": capabilities,
+            }),
+        )
+        .await
+    }
+
+    async fn send_result(
+        &self,
+        request_id: &str,
+        status: &str,
+        data: Option<String>,
+        error: Option<String>,
+    ) -> Result<()> {
+        self.post(
+            "/api/link/result",
+            &serde_json::json!({
+                "request_id": request_id,
+                "status": status,
+                "data": data,
+                "error": error,
+            }),
+        )
+        .await
+    }
+}
+
+/// SSE event data types from the server
+
+#[derive(Debug, Deserialize)]
+struct ConnectedEvent {
+    connection_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExecuteEvent {
+    request_id: String,
+    capability: String,
+    params: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct CcStartEvent {
+    request_id: String,
+    cwd: String,
+    prompt: String,
 }
 
 /// Try to get dev credentials from the server (only works when server is in dev mode)
@@ -168,14 +205,6 @@ async fn try_dev_credentials() -> Result<config::Credentials> {
         user_id,
         email,
     })
-}
-
-/// Why the connection ended
-enum DisconnectReason {
-    /// Transient error (timeout, network blip) — should reconnect
-    Transient(String),
-    /// Server explicitly closed the connection — should reconnect (server may be restarting)
-    ServerClosed,
 }
 
 /// List detected capabilities and exit
@@ -287,19 +316,19 @@ pub async fn start(capabilities_filter: Option<String>, persistent: bool) -> Res
             config::load_credentials()?.unwrap_or_else(|| creds.clone())
         };
 
-        match run_connection(&current_creds, &capabilities).await {
-            Ok((DisconnectReason::Transient(reason), was_connected)) => {
-                eprintln!("{} Disconnected: {}", "●".red(), reason);
-                if was_connected {
-                    backoff_secs = 1;
-                }
-            }
-            Ok((DisconnectReason::ServerClosed, _)) => {
-                println!("{} Connection closed by server", "●".red());
+        let was_connected = run_connection(&current_creds, &capabilities).await;
+
+        match was_connected {
+            Ok(true) => {
+                // Was connected before disconnect — reset backoff
+                eprintln!("{} Disconnected", "●".red());
                 backoff_secs = 1;
             }
+            Ok(false) => {
+                eprintln!("{} Connection failed", "●".red());
+            }
             Err(e) => {
-                eprintln!("{} Connection failed: {}", "●".red(), e);
+                eprintln!("{} Connection error: {}", "●".red(), e);
             }
         }
 
@@ -309,147 +338,228 @@ pub async fn start(capabilities_filter: Option<String>, persistent: bool) -> Res
     }
 }
 
-/// Run a single WebSocket connection. Returns (reason, was_connected).
-async fn run_connection(
-    creds: &config::Credentials,
-    capabilities: &[Capability],
-) -> Result<(DisconnectReason, bool)> {
-    // Connect to server using refresh token directly
-    let ws_url = format!(
-        "{}/ws/link?token={}",
-        config::server_url()
-            .replace("http://", "ws://")
-            .replace("https://", "wss://"),
+/// Run a single SSE connection. Returns Ok(true) if was connected before disconnect.
+async fn run_connection(creds: &config::Credentials, capabilities: &[Capability]) -> Result<bool> {
+    let sse_url = format!(
+        "{}/api/link/stream?token={}",
+        config::server_url(),
         urlencoding::encode(&creds.refresh_token)
     );
 
-    let (ws_stream, _response) = connect_async(&ws_url)
-        .await
-        .context("Failed to connect to Enki server")?;
-
-    println!("{} Connected", "●".green());
-
-    let (mut write, mut read) = ws_stream.split();
-
-    // Send announce message
-    let announce = ClientMessage::Announce {
-        capabilities: capabilities.to_vec(),
-    };
-    write
-        .send(Message::Text(serde_json::to_string(&announce)?.into()))
-        .await?;
-
-    println!("{} Link active. Press Ctrl+C to disconnect.\n", "●".green());
-
-    // Channel for outgoing messages from ClaudeCodeManager
-    let (cc_tx, mut cc_rx) = mpsc::unbounded_channel::<String>();
-    let cc_manager = ClaudeCodeManager::new(cc_tx);
+    let link_client = Arc::new(LinkClient::new(&creds.refresh_token));
+    let mut es = EventSource::get(&sse_url);
+    let mut was_connected = false;
 
     // Wrap in LocalSet since ACP futures are !Send
     let local = tokio::task::LocalSet::new();
-    let reason = local
-        .run_until(async move {
-            loop {
-                tokio::select! {
-                    msg = read.next() => {
-                        match msg {
-                            Some(Ok(Message::Text(text))) => {
-                                match serde_json::from_str::<ServerMessage>(&text) {
-                                    Ok(ServerMessage::Execute { request_id, capability, params }) => {
-                                        let summary = execution_summary(&capability, &params);
-                                        if summary.is_empty() {
-                                            println!("  {} {}", "▸".cyan(), capability.bold());
-                                        } else {
-                                            println!("  {} {} {}", "▸".cyan(), capability.bold(), summary.dimmed());
-                                        }
+    let result: Result<bool> = local
+        .run_until(async {
+            let mut cc_manager: Option<ClaudeCodeManager> = None;
 
-                                        let result = execute_capability(&capability, &params).await;
+            while let Some(event) = es.next().await {
+                match event {
+                    Ok(Event::Open) => {
+                        // SSE connection opened, wait for connected event
+                    }
+                    Ok(Event::Message(msg)) => {
+                        match msg.event.as_str() {
+                            "connected" => {
+                                let data: ConnectedEvent = serde_json::from_str(&msg.data)
+                                    .context("Bad connected event")?;
 
-                                        let response = match result {
-                                            Ok(data) => ClientMessage::Result {
-                                                request_id,
-                                                status: "success".to_string(),
-                                                data: Some(data),
-                                                error: None,
-                                            },
-                                            Err(e) => ClientMessage::Result {
-                                                request_id,
-                                                status: "error".to_string(),
-                                                data: None,
-                                                error: Some(e.to_string()),
-                                            },
-                                        };
+                                was_connected = true;
+                                println!("{} Connected", "●".green());
 
-                                        write.send(Message::Text(serde_json::to_string(&response)?.into())).await?;
-                                    }
-                                    Ok(ServerMessage::Pong) => {}
-                                    Ok(ServerMessage::Error { message }) => {
-                                        eprintln!("  {} {}", "✗".red(), message);
-                                    }
+                                // Announce capabilities
+                                link_client
+                                    .announce(&data.connection_id, capabilities)
+                                    .await?;
 
-                                    // Claude Code session messages
-                                    Ok(ServerMessage::CcStart { request_id, cwd, prompt }) => {
-                                        let truncated: String = prompt.chars().take(60).collect();
-                                        println!("  {} {} {}", "▸".cyan(), "claude_code".bold(), truncated.dimmed());
-                                        if let Err(e) = cc_manager.start_session(request_id, cwd, prompt).await {
-                                            eprintln!("  {} {}", "✗".red(), e);
-                                        }
-                                    }
-                                    Ok(ServerMessage::CcPrompt { session_id, prompt }) => {
-                                        println!("  {} {} {}", "▸".cyan(), "claude_code".bold(), format!("follow-up {}", &session_id[..8.min(session_id.len())]).dimmed());
-                                        if let Err(e) = cc_manager.send_prompt(&session_id, prompt).await {
-                                            eprintln!("  {} {}", "✗".red(), e);
-                                        }
-                                    }
-                                    Ok(ServerMessage::CcPermissionResponse { session_id: _, permission_id, approved }) => {
-                                        cc_manager.handle_permission_response(&permission_id, approved);
-                                    }
-                                    Ok(ServerMessage::CcCancel { session_id }) => {
-                                        println!("  {} {} {}", "▸".cyan(), "claude_code".bold(), "cancel".dimmed());
-                                        if let Err(e) = cc_manager.cancel_session(&session_id).await {
-                                            eprintln!("  {} {}", "✗".red(), e);
-                                        }
-                                    }
-                                    Ok(ServerMessage::CcInterrupt { session_id }) => {
-                                        println!("  {} {} {}", "▸".cyan(), "claude_code".bold(), "interrupt".dimmed());
-                                        if let Err(e) = cc_manager.interrupt_session(&session_id).await {
-                                            eprintln!("  {} {}", "✗".red(), e);
-                                        }
-                                    }
+                                // Create ClaudeCodeManager with the link client
+                                cc_manager = Some(ClaudeCodeManager::new(link_client.clone()));
 
-                                    Err(e) => {
-                                        eprintln!("  {} Parse error: {}", "✗".red(), e);
+                                println!(
+                                    "{} Link active. Press Ctrl+C to disconnect.\n",
+                                    "●".green()
+                                );
+                            }
+                            "execute" => {
+                                let data: ExecuteEvent =
+                                    serde_json::from_str(&msg.data).context("Bad execute event")?;
+
+                                let summary = execution_summary(&data.capability, &data.params);
+                                if summary.is_empty() {
+                                    println!("  {} {}", "▸".cyan(), data.capability.bold());
+                                } else {
+                                    println!(
+                                        "  {} {} {}",
+                                        "▸".cyan(),
+                                        data.capability.bold(),
+                                        summary.dimmed()
+                                    );
+                                }
+
+                                let client = link_client.clone();
+                                let request_id = data.request_id;
+                                let capability = data.capability;
+                                let params = data.params;
+
+                                tokio::task::spawn_local(async move {
+                                    let result = execute_capability(&capability, &params).await;
+
+                                    let post_result = match result {
+                                        Ok(result_data) => {
+                                            client
+                                                .send_result(
+                                                    &request_id,
+                                                    "success",
+                                                    Some(result_data),
+                                                    None,
+                                                )
+                                                .await
+                                        }
+                                        Err(e) => {
+                                            client
+                                                .send_result(
+                                                    &request_id,
+                                                    "error",
+                                                    None,
+                                                    Some(e.to_string()),
+                                                )
+                                                .await
+                                        }
+                                    };
+
+                                    if let Err(e) = post_result {
+                                        eprintln!("  {} Failed to post result: {}", "✗".red(), e);
+                                    }
+                                });
+                            }
+                            "cc_start" => {
+                                let data: CcStartEvent = serde_json::from_str(&msg.data)
+                                    .context("Bad cc_start event")?;
+
+                                let truncated: String = data.prompt.chars().take(60).collect();
+                                println!(
+                                    "  {} {} {}",
+                                    "▸".cyan(),
+                                    "claude_code".bold(),
+                                    truncated.dimmed()
+                                );
+
+                                if let Some(ref mgr) = cc_manager {
+                                    if let Err(e) = mgr
+                                        .start_session(data.request_id, data.cwd, data.prompt)
+                                        .await
+                                    {
+                                        eprintln!("  {} {}", "✗".red(), e);
                                     }
                                 }
                             }
-                            Some(Ok(Message::Close(_))) => {
-                                return Ok::<_, anyhow::Error>((DisconnectReason::ServerClosed, true));
+                            "cc_message" => {
+                                let data: serde_json::Value = serde_json::from_str(&msg.data)
+                                    .context("Bad cc_message event")?;
+
+                                if let Some(ref mgr) = cc_manager {
+                                    handle_cc_message(mgr, &data).await;
+                                }
                             }
-                            Some(Err(e)) => {
-                                return Ok((DisconnectReason::Transient(e.to_string()), true));
+                            _ => {
+                                // Unknown event type, ignore
                             }
-                            None => {
-                                return Ok((DisconnectReason::Transient("connection closed".to_string()), true));
-                            }
-                            _ => {}
                         }
                     }
-
-                    // Outgoing messages from ClaudeCodeManager
-                    Some(msg) = cc_rx.recv() => {
-                        write.send(Message::Text(msg.into())).await?;
+                    Err(reqwest_eventsource::Error::StreamEnded) => {
+                        break;
                     }
-
-                    // Send periodic ping
-                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(30)) => {
-                        write.send(Message::Text(serde_json::to_string(&ClientMessage::Ping)?.into())).await?;
+                    Err(e) => {
+                        eprintln!("{} SSE error: {}", "✗".red(), e);
+                        break;
                     }
                 }
             }
-        })
-        .await?;
 
-    Ok(reason)
+            Ok(was_connected)
+        })
+        .await;
+
+    es.close();
+    result
+}
+
+/// Handle incoming Claude Code messages from the server
+async fn handle_cc_message(mgr: &ClaudeCodeManager, data: &serde_json::Value) {
+    let msg_type = data.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+    match msg_type {
+        "cc_prompt" => {
+            let session_id = data
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let prompt = data.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+
+            println!(
+                "  {} {} {}",
+                "▸".cyan(),
+                "claude_code".bold(),
+                format!("follow-up {}", &session_id[..8.min(session_id.len())]).dimmed()
+            );
+
+            if let Err(e) = mgr.send_prompt(session_id, prompt.to_string()).await {
+                eprintln!("  {} {}", "✗".red(), e);
+            }
+        }
+        "cc_permission_response" => {
+            let permission_id = data
+                .get("permission_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let approved = data
+                .get("approved")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            mgr.handle_permission_response(permission_id, approved);
+        }
+        "cc_cancel" => {
+            let session_id = data
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            println!(
+                "  {} {} {}",
+                "▸".cyan(),
+                "claude_code".bold(),
+                "cancel".dimmed()
+            );
+
+            if let Err(e) = mgr.cancel_session(session_id).await {
+                eprintln!("  {} {}", "✗".red(), e);
+            }
+        }
+        "cc_interrupt" => {
+            let session_id = data
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            println!(
+                "  {} {} {}",
+                "▸".cyan(),
+                "claude_code".bold(),
+                "interrupt".dimmed()
+            );
+
+            if let Err(e) = mgr.interrupt_session(session_id).await {
+                eprintln!("  {} {}", "✗".red(), e);
+            }
+        }
+        _ => {
+            // Unknown cc message type
+        }
+    }
 }
 
 /// Detect capabilities this machine can provide
@@ -811,7 +921,7 @@ async fn cap_fs_edit(params: &serde_json::Value) -> Result<String> {
 
     if norm_count == 1 {
         // Find the position in normalized content, then map back to original
-        let norm_pos = norm_content.find(&norm_old).unwrap();
+        let norm_pos = norm_content.find(&norm_old).unwrap_or(0);
 
         // Map normalized position to original position by walking both strings
         let mut orig_idx = 0;
